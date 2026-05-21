@@ -2,6 +2,11 @@
 name = "keystone-core"
 version = "0.1.0"
 edition = "2024"
+description = "Portable identity, signed social graph, and P2P transport primitives for the Keystone protocol"
+license = "MIT"
+repository = "https://github.com/tyrion777-stack/keystone-core"
+keywords = ["p2p", "identity", "ed25519", "libp2p", "decentralized"]
+categories = ["network-programming", "cryptography", "authentication"]
 
 [dependencies]
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
