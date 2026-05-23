@@ -16,4 +16,7 @@ pub enum KeystoneError {
 
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    #[error("Key storage error: {0}")]
+    KeyStorage(String),
 }

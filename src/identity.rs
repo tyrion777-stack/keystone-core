@@ -1,8 +1,18 @@
+use std::path::Path;
+
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Key, Nonce,
+};
+use argon2::Argon2;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand::rngs::OsRng;
+use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
 use crate::error::KeystoneError;
+
+const SALT_LEN: usize = 16;
+const NONCE_LEN: usize = 12;
 
 /// A Keystone identity. The signing_key is the private half — never share it.
 /// The public key (verifying_key) is your permanent, portable identity on the network.
@@ -50,6 +60,62 @@ impl Identity {
     /// Treat this like a password — whoever has it controls the identity.
     pub fn private_key_hex(&self) -> String {
         hex::encode(self.signing_key.to_bytes())
+    }
+
+    /// Save the identity to disk, locked with a password.
+    /// The file is useless without the password — safe to store anywhere.
+    pub fn save_encrypted<P: AsRef<Path>>(&self, path: P, password: &str) -> Result<(), KeystoneError> {
+        let mut salt = [0u8; SALT_LEN];
+        let mut nonce = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut salt);
+        OsRng.fill_bytes(&mut nonce);
+
+        let mut enc_key = [0u8; 32];
+        Argon2::default()
+            .hash_password_into(password.as_bytes(), &salt, &mut enc_key)
+            .map_err(|e| KeystoneError::KeyStorage(e.to_string()))?;
+
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&enc_key));
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce), self.signing_key.to_bytes().as_ref())
+            .map_err(|e| KeystoneError::KeyStorage(e.to_string()))?;
+
+        let mut blob = Vec::with_capacity(SALT_LEN + NONCE_LEN + ciphertext.len());
+        blob.extend_from_slice(&salt);
+        blob.extend_from_slice(&nonce);
+        blob.extend_from_slice(&ciphertext);
+
+        std::fs::write(path, blob).map_err(|e| KeystoneError::KeyStorage(e.to_string()))
+    }
+
+    /// Load an identity from a previously saved encrypted file.
+    /// Returns an error if the password is wrong or the file is corrupted.
+    pub fn load_encrypted<P: AsRef<Path>>(path: P, password: &str) -> Result<Self, KeystoneError> {
+        let blob = std::fs::read(path).map_err(|e| KeystoneError::KeyStorage(e.to_string()))?;
+
+        if blob.len() < SALT_LEN + NONCE_LEN + 1 {
+            return Err(KeystoneError::KeyStorage("file is too short or corrupted".into()));
+        }
+
+        let salt = &blob[..SALT_LEN];
+        let nonce = &blob[SALT_LEN..SALT_LEN + NONCE_LEN];
+        let ciphertext = &blob[SALT_LEN + NONCE_LEN..];
+
+        let mut enc_key = [0u8; 32];
+        Argon2::default()
+            .hash_password_into(password.as_bytes(), salt, &mut enc_key)
+            .map_err(|e| KeystoneError::KeyStorage(e.to_string()))?;
+
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&enc_key));
+        let private_key_bytes = cipher
+            .decrypt(Nonce::from_slice(nonce), ciphertext)
+            .map_err(|_| KeystoneError::KeyStorage("wrong password or corrupted file".into()))?;
+
+        let arr: [u8; 32] = private_key_bytes
+            .try_into()
+            .map_err(|_| KeystoneError::KeyStorage("invalid key length in file".into()))?;
+
+        Ok(Self { signing_key: SigningKey::from_bytes(&arr) })
     }
 
     /// Sign a string message. Hashes the content with Blake3 first,
@@ -169,5 +235,32 @@ mod tests {
         let json = msg.to_json().unwrap();
         let restored = SignedMessage::from_json(&json).unwrap();
         assert!(restored.verify().is_ok());
+    }
+
+    #[test]
+    fn encrypted_save_and_load_restores_identity() {
+        let id = Identity::generate();
+        let path = std::env::temp_dir().join("keystone_test_key.bin");
+
+        id.save_encrypted(&path, "my-secret-password").unwrap();
+        let restored = Identity::load_encrypted(&path, "my-secret-password").unwrap();
+
+        assert_eq!(id.public_key_hex(), restored.public_key_hex());
+        let msg = restored.sign("still me");
+        assert!(msg.verify().is_ok());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn wrong_password_fails_to_load() {
+        let id = Identity::generate();
+        let path = std::env::temp_dir().join("keystone_test_key_wrong.bin");
+
+        id.save_encrypted(&path, "correct-password").unwrap();
+        let result = Identity::load_encrypted(&path, "wrong-password");
+
+        assert!(result.is_err());
+        std::fs::remove_file(&path).ok();
     }
 }

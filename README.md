@@ -27,18 +27,29 @@ A Keystone identity is an Ed25519 keypair. There is no username, email, or passw
 ```rust
 use keystone_core::Identity;
 
-// Generate a new identity (new keypair)
+// Generate a new identity
 let identity = Identity::generate();
 
 // The public key is the user's address — store this in your database
 println!("{}", identity.public_key_hex());
 
-// The private key never leaves the user's device
-println!("{}", identity.private_key_hex());
+// Save to disk, locked with a password — safe to store anywhere
+identity.save_encrypted("/path/to/keystone.key", "user-password")?;
 
-// Restore an identity from a stored private key
-let identity = Identity::from_private_key_hex("abcd1234...")?;
+// Later — restore from disk with the same password
+let identity = Identity::load_encrypted("/path/to/keystone.key", "user-password")?;
+
+// Wrong password returns an error — the file is useless without it
 ```
+
+**What `save_encrypted` does under the hood:**
+1. Generates a random salt and nonce
+2. Runs the password through Argon2id (slow by design — defeats brute force)
+3. Encrypts the private key with AES-256-GCM
+4. Writes `salt + nonce + ciphertext` to disk — 76 bytes total
+
+The user never sees a hex string. The app calls `save_encrypted` on registration
+and `load_encrypted` on login.
 
 ### Signing and Verification
 
