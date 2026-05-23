@@ -25,7 +25,15 @@ pub struct KeystoneBehaviour {
 }
 
 pub fn build_swarm() -> Result<Swarm<KeystoneBehaviour>, Box<dyn std::error::Error>> {
-    let swarm = SwarmBuilder::with_new_identity()
+    build_swarm_with_keypair(libp2p::identity::Keypair::generate_ed25519())
+}
+
+/// Build a swarm with a specific keypair — used by the bootstrap node so its
+/// peer ID stays stable across restarts.
+pub fn build_swarm_with_keypair(
+    keypair: libp2p::identity::Keypair,
+) -> Result<Swarm<KeystoneBehaviour>, Box<dyn std::error::Error>> {
+    let swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
