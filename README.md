@@ -57,6 +57,13 @@ Any piece of content can be signed. The signature proves:
 1. The content came from the holder of a specific keypair
 2. The content has not been modified since it was signed
 
+> **Important for non-Rust integrations:** The signature is computed over
+> `content_hash.as_bytes()` — the UTF-8 bytes of the Blake3 hex string, not
+> the raw content bytes. When reimplementing verification in JavaScript,
+> Python, or any other language, sign and verify the hex string's bytes,
+> not the original content's bytes. Getting this wrong produces a valid-looking
+> flow that fails verification with no obvious error.
+
 ```rust
 use keystone_core::Identity;
 
@@ -219,6 +226,38 @@ for record in store.all() {
 ```
 
 Follow records travel peer-to-peer — no central database required.
+
+---
+
+## Integration Patterns
+
+### Rust sidecar (non-Rust backends)
+
+If your main app is not Rust (SvelteKit, Django, Rails, etc.), run keystone-core
+as a small Axum HTTP sidecar — a separate process/container on the internal network.
+Your app calls it over HTTP, never exposes it publicly.
+
+```
+Browser  →  your app (SvelteKit/etc)  →  keystone sidecar (Rust/Axum, internal only)
+                                              ↓
+                                        challenge/verify endpoints
+                                        SignedMessage::verify()
+                                        session cookie issued on success
+```
+
+The sidecar handles only two things: issue challenges and verify signed responses.
+Everything else (sessions, DB, business logic) stays in your main app.
+
+In multi-tenant setups, run one sidecar container per client stack — each isolated,
+each on its own internal Docker network.
+
+### Browser-side key storage (JavaScript)
+
+Replicate `save_encrypted` / `load_encrypted` using the browser's WebCrypto API:
+- Argon2id (via a WASM port) + AES-256-GCM, same algorithm as the Rust implementation
+- Store the encrypted blob in `localStorage` or `IndexedDB`
+- Keys are device-bound — one keypair per device
+- Enrol new devices via a one-time link from an already-authenticated session
 
 ---
 

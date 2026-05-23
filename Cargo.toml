@@ -1,6 +1,6 @@
 [package]
 name = "keystone-core"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Portable identity, signed social graph, and P2P transport primitives for the Keystone protocol"
 license = "MIT"
