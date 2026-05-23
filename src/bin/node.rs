@@ -7,7 +7,9 @@ use keystone_core::{
     network::{build_swarm, KeystoneBehaviourEvent},
     protocol::{FollowRequest, FollowResponse},
 };
-use libp2p::{identify, mdns, request_response, swarm::SwarmEvent, PeerId};
+use libp2p::{identify, mdns, request_response, swarm::SwarmEvent, Multiaddr, PeerId};
+
+const BOOTSTRAP_ADDR: &str = "/ip4/124.43.78.112/tcp/9000/p2p/12D3KooWCruYnFTDrFoNPtHpaGPcWm4NvfzjyS7uVqWCBimievS2";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,6 +43,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
+    // Dial the bootstrap node to seed the DHT — enables internet-wide peer discovery
+    let bootstrap: Multiaddr = BOOTSTRAP_ADDR.parse()?;
+    match swarm.dial(bootstrap) {
+        Ok(_)  => println!("[b] Dialing bootstrap node..."),
+        Err(e) => println!("[b] Bootstrap dial failed: {e} (continuing with mDNS only)"),
+    }
+
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => {
@@ -68,7 +77,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Identify fires after the full handshake — the connection is settled and
                 // both sides know each other's protocols. Safe to send a request now.
-                KeystoneBehaviourEvent::Identify(identify::Event::Received { peer_id, .. }) => {
+                KeystoneBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. }) => {
+                    // Add all known addresses to Kademlia routing table
+                    for addr in &info.listen_addrs {
+                        swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                    }
+                    // Kick off a DHT bootstrap query to find more peers
+                    let _ = swarm.behaviour_mut().kad.bootstrap();
+
                     if query_mode && requested.insert(peer_id) {
                         println!("[>] Connection ready, requesting follows from {peer_id}");
                         swarm.behaviour_mut().follows.send_request(&peer_id, FollowRequest);
