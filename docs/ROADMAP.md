@@ -34,12 +34,15 @@ content is self-verifying: it doesn't matter who hands it to you, the math prove
 
 ## What's Next
 
-### Quiz App Integration (current priority)
-- [ ] Add `keystone-core` as git dependency in elrquiz backend
-- [ ] DB migration: `ALTER TABLE users ADD COLUMN keystone_public_key TEXT UNIQUE;`
-- [ ] Auth endpoints: challenge/response login (alternative to Google Auth)
-- [ ] Credential endpoint: signed score record issued on quiz completion
-- [ ] Quiz app keypair — encrypted at rest with Argon2id + AES-256-GCM
+### Real-World Integration ✓ DONE — DeltaType
+- [x] Add `keystone-core` as dependency in a production app
+- [x] DB migration: `keystone_public_key` column on users table
+- [x] Challenge/response auth endpoints (alternative to existing login)
+- [ ] Credential endpoint: signed records issued on user actions
+- [ ] App keypair encrypted at rest with Argon2id + AES-256-GCM
+
+First external app running Keystone auth in production.
+The quiz app (elrquiz) follows the same pattern.
 
 ### Week 4 — Content Layer
 - [ ] `ContentStore` — store and retrieve blobs by Blake3 hash
