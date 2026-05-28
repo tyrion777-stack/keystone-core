@@ -7,7 +7,7 @@ use keystone_core::{
     network::{build_swarm_with_keypair, keypair_from_identity, KeystoneBehaviourEvent},
     protocol::{FollowRequest, FollowResponse},
 };
-use libp2p::{identify, mdns, request_response, swarm::SwarmEvent, Multiaddr, PeerId};
+use libp2p::{identify, kad, mdns, request_response, swarm::SwarmEvent, Multiaddr, PeerId};
 
 const BOOTSTRAP_ADDR: &str = "/ip4/124.43.78.112/tcp/9000/p2p/12D3KooWCruYnFTDrFoNPtHpaGPcWm4NvfzjyS7uVqWCBimievS2";
 const DEFAULT_KEY_FILE: &str = "keystone.key";
@@ -48,6 +48,13 @@ fn load_or_create_identity(path: &PathBuf) -> Result<Identity, Box<dyn std::erro
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query_mode = std::env::args().any(|a| a == "--query");
+
+    // --find <pubkey_hex>  →  look up a Keystone identity on the DHT
+    let find_key: Option<String> = std::env::args()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find(|w| w[0] == "--find")
+        .map(|w| w[1].clone());
 
     // Key file path — use first argument if provided, otherwise default
     let key_path = std::env::args()
@@ -101,6 +108,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => println!("[b] Bootstrap dial failed: {e} (continuing with mDNS only)"),
     }
 
+    if let Some(ref key) = find_key {
+        println!("[?] Will look up identity: {}...", &key[..16.min(key.len())]);
+    }
+
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => {
@@ -147,6 +158,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     let _ = swarm.behaviour_mut().kad.put_record(record, libp2p::kad::Quorum::One);
 
+                    // If --find was requested, fire the DHT lookup now that we have
+                    // at least one peer in our routing table
+                    if let Some(ref key) = find_key {
+                        let dht_key = libp2p::kad::RecordKey::new(key);
+                        swarm.behaviour_mut().kad.get_record(dht_key);
+                        println!("[?] DHT query fired — waiting for result...");
+                    }
+
                     if query_mode && requested.insert(peer_id) {
                         println!("[>] Connection ready, requesting follows from {peer_id}");
                         swarm.behaviour_mut().follows.send_request(&peer_id, FollowRequest);
@@ -187,6 +206,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     peer, error, ..
                 }) => {
                     println!("[!] Request to {peer} failed: {error}");
+                }
+
+                // DHT query result — someone looked up a public key
+                KeystoneBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
+                    result: kad::QueryResult::GetRecord(result),
+                    step,
+                    ..
+                }) => {
+                    match result {
+                        Ok(kad::GetRecordOk::FoundRecord(record)) if step.last => {
+                            match PeerId::from_bytes(&record.record.value) {
+                                Ok(found_peer_id) => {
+                                    let key_str = String::from_utf8_lossy(record.record.key.as_ref());
+                                    println!("\n[✓] Identity found on network!");
+                                    println!("    Public key : {}...", &key_str[..16.min(key_str.len())]);
+                                    println!("    Peer ID    : {found_peer_id}");
+                                    println!("    → Connect to this peer to interact with them.\n");
+                                }
+                                Err(_) => println!("[!] Found record but could not decode peer ID."),
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(kad::GetRecordError::NotFound { .. }) => {
+                            println!("[✗] Identity not found on the network.");
+                            println!("    They may be offline or haven't published yet.");
+                        }
+                        Err(e) => println!("[!] DHT lookup error: {e:?}"),
+                    }
                 }
 
                 _ => {}
