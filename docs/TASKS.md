@@ -28,7 +28,7 @@
 
 ---
 
-## Phase 3 — Identity on the Network ← CURRENT
+## Phase 3 — Identity on the Network ✓ DONE
 *Goal: your keypair IS your presence on the network — not a random peer ID*
 
 - [x] Node loads identity from disk on startup (not a throwaway keypair)
@@ -38,12 +38,18 @@
 - [x] Follow records served by a node are tied to its real identity
 - [x] DHT revocation records
       (publish signed notice when a key is compromised — verifiers check before accepting)
-- [ ] Per-app subkeys
-      (derive different keypair per platform from one master — stops cross-platform tracking)
+- [ ] Per-app subkeys — DEFERRED to Phase 5
+      Considered and deliberately pushed back. Subkeys fragment Joe's identity —
+      his follow graph no longer travels automatically between platforms, which
+      breaks the core promise ("enter the network once, be part of it everywhere").
+      The privacy problem subkeys solve (platforms cross-correlating users) is
+      real but better addressed through selective disclosure in Phase 5, not
+      identity fragmentation. Subkeys remain the right answer for high-risk users
+      (activists, whistleblowers) — not the default for Joe, Pete, or Maria.
 
 ---
 
-## Phase 4 — Content Layer
+## Phase 4 — Content Layer ← CURRENT
 *Goal: files stored and retrieved by hash — no server, no URL that can break*
 
 - [ ] ContentStore — store blobs by Blake3 hash
