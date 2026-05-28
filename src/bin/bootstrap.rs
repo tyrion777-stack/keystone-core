@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_KEY_PATH));
 
     let keypair = load_or_create_keypair(&key_path);
-    let mut swarm = build_swarm_with_keypair(keypair)?;
+    let mut swarm = build_swarm_with_keypair(keypair, "keystone-bootstrap/1.0")?;
 
     swarm.behaviour_mut().kad.set_mode(Some(kad::Mode::Server));
     swarm.listen_on("/ip4/0.0.0.0/tcp/9000".parse()?)?;
