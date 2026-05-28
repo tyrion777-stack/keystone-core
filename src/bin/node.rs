@@ -56,6 +56,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .find(|w| w[0] == "--find")
         .map(|w| w[1].clone());
 
+    // --follow <pubkey_hex>  →  create and serve a follow record for that key
+    let follow_key: Option<String> = std::env::args()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find(|w| w[0] == "--follow")
+        .map(|w| w[1].clone());
+
     // Key file path — use first argument if provided, otherwise default
     let key_path = std::env::args()
         .nth(1)
@@ -85,18 +92,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Peer ID is now derived from your public key — stable across restarts
     println!("Peer ID    : {}", swarm.local_peer_id());
 
-    if !query_mode {
-        let demo_followee = Identity::generate();
-        let record = create_follow(&identity, &demo_followee.public_key_hex());
+    if let Some(ref followee_pubkey) = follow_key {
+        let record = create_follow(&identity, followee_pubkey);
         store.add(record).unwrap();
         println!(
-            "\n[f] Follow created : {} → {}",
+            "\n[f] Follow recorded : {} → {}",
             &identity.public_key_hex()[..12],
-            &demo_followee.public_key_hex()[..12]
+            &followee_pubkey[..12.min(followee_pubkey.len())]
         );
-        println!("    Serving {} follow record(s). Waiting for peers...\n", store.len());
-    } else {
+    }
+
+    if query_mode {
         println!("\n[?] Query mode — will request follows from any discovered peer\n");
+    } else {
+        println!("    Serving {} follow record(s). Waiting for peers...\n", store.len());
     }
 
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
