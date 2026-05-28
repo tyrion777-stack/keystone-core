@@ -31,6 +31,36 @@ pub fn create_follow(identity: &Identity, followee_pubkey: &str) -> FollowRecord
     identity.sign(&serde_json::to_string(&payload).unwrap())
 }
 
+/// The payload inside a revocation record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevocationPayload {
+    pub revoked_key: String, // public key hex being revoked
+    pub reason: String,
+    pub timestamp: u64,
+}
+
+/// A revocation record is a SignedMessage whose content is a RevocationPayload.
+/// The key holder signs their own key out of existence — proves they authorized it.
+pub type RevocationRecord = SignedMessage;
+
+/// Sign a revocation for your own key.
+pub fn create_revocation(identity: &Identity, reason: &str) -> RevocationRecord {
+    let payload = RevocationPayload {
+        revoked_key: identity.public_key_hex(),
+        reason: reason.to_string(),
+        timestamp: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    };
+    identity.sign(&serde_json::to_string(&payload).unwrap())
+}
+
+/// DHT key format for revocation records.
+pub fn revocation_dht_key(pubkey_hex: &str) -> String {
+    format!("revoked:{pubkey_hex}")
+}
+
 /// In-memory store for follow records. Week 4 will persist this to disk.
 #[derive(Default)]
 pub struct FollowStore {

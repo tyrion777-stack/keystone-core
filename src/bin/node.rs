@@ -1,9 +1,9 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{collections::{HashMap, HashSet}, path::PathBuf};
 
 use futures::StreamExt;
 use keystone_core::{
-    follow::{create_follow, FollowPayload, FollowStore},
-    identity::Identity,
+    follow::{create_follow, create_revocation, revocation_dht_key, FollowPayload, FollowStore, RevocationPayload},
+    identity::{Identity, SignedMessage},
     network::{build_swarm_with_keypair, keypair_from_identity, KeystoneBehaviourEvent},
     protocol::{FollowRequest, FollowResponse},
 };
@@ -12,32 +12,20 @@ use libp2p::{identify, kad, mdns, request_response, swarm::SwarmEvent, Multiaddr
 const BOOTSTRAP_ADDR: &str = "/ip4/124.43.78.112/tcp/9000/p2p/12D3KooWCruYnFTDrFoNPtHpaGPcWm4NvfzjyS7uVqWCBimievS2";
 const DEFAULT_KEY_FILE: &str = "keystone.key";
 
-/// Load identity from disk, or create a new one if no key file exists yet.
-/// Either way, the user types a password — never stored anywhere, only used
-/// to encrypt/decrypt the key file.
 fn load_or_create_identity(path: &PathBuf) -> Result<Identity, Box<dyn std::error::Error>> {
     if path.exists() {
-        // Key file found — ask for password to unlock it
         let password = rpassword::prompt_password("Enter password: ")?;
         let identity = Identity::load_encrypted(path, &password)?;
         println!("Identity loaded.");
         Ok(identity)
     } else {
-        // First run — generate a new identity and save it
         println!("No identity found at {}.", path.display());
         println!("Creating a new identity...");
-
-        // Ask for a password twice to avoid typos
-        // rpassword reads from the terminal without showing what's typed
         let password = rpassword::prompt_password("Set a password: ")?;
         let confirm  = rpassword::prompt_password("Confirm password: ")?;
-
         if password != confirm {
-            // Return an error — in Rust, Box<dyn Error> is a catch-all error type
-            // that can hold any kind of error
             return Err("Passwords do not match.".into());
         }
-
         let identity = Identity::generate();
         identity.save_encrypted(path, &password)?;
         println!("New identity created and saved to {}.", path.display());
@@ -47,49 +35,41 @@ fn load_or_create_identity(path: &PathBuf) -> Result<Identity, Box<dyn std::erro
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let query_mode = std::env::args().any(|a| a == "--query");
+    let args: Vec<String> = std::env::args().collect();
 
-    // --find <pubkey_hex>  →  look up a Keystone identity on the DHT
-    let find_key: Option<String> = std::env::args()
-        .collect::<Vec<_>>()
-        .windows(2)
+    let query_mode  = args.iter().any(|a| a == "--query");
+    let revoke_mode = args.iter().any(|a| a == "--revoke");
+
+    let find_key: Option<String> = args.windows(2)
         .find(|w| w[0] == "--find")
         .map(|w| w[1].clone());
 
-    // --follow <pubkey_hex>  →  create and serve a follow record for that key
-    let follow_key: Option<String> = std::env::args()
-        .collect::<Vec<_>>()
-        .windows(2)
+    let follow_key: Option<String> = args.windows(2)
         .find(|w| w[0] == "--follow")
         .map(|w| w[1].clone());
 
-    // Key file path — use first argument if provided, otherwise default
-    let key_path = std::env::args()
-        .nth(1)
-        .filter(|a| !a.starts_with("--"))  // ignore flags like --query
+    let key_path = args.iter()
+        .skip(1)
+        .find(|a| !a.starts_with("--"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_KEY_FILE));
 
-    // Load or create the identity — this is the real YOU on the network
     let identity = load_or_create_identity(&key_path)?;
-
-    // Convert our Keystone identity into a libp2p keypair so the swarm can use it.
-    // Same Ed25519 key underneath — the swarm's peer ID is now derived from YOUR key,
-    // not a random throwaway. That means your peer ID is stable and tied to your identity.
     let libp2p_keypair = keypair_from_identity(&identity)?;
-
-    // Broadcast our Keystone public key to every peer we connect with.
-    // The identify protocol sends this string on every handshake — peers
-    // read it and know who they're talking to.
     let agent = format!("keystone/1.0/{}", identity.public_key_hex());
     let mut swarm = build_swarm_with_keypair(libp2p_keypair, &agent)?;
     let mut store = FollowStore::new();
     let mut dialed: HashSet<PeerId> = HashSet::new();
     let mut requested: HashSet<PeerId> = HashSet::new();
 
+    // Track async DHT queries so we know what each result is for.
+    // --find fires one lookup; revocation checks fire one per key we want to verify.
+    let mut find_query_id: Option<kad::QueryId> = None;
+    let mut revocation_checks: HashMap<kad::QueryId, String> = HashMap::new();
+    let mut revoke_published = false;
+
     println!("\n=== Keystone Node ===");
     println!("Public key : {}", identity.public_key_hex());
-    // Peer ID is now derived from your public key — stable across restarts
     println!("Peer ID    : {}", swarm.local_peer_id());
 
     if let Some(ref followee_pubkey) = follow_key {
@@ -102,6 +82,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    if revoke_mode {
+        println!("\n[!] Revoke mode — will publish revocation once DHT is reachable.");
+    }
+
     if query_mode {
         println!("\n[?] Query mode — will request follows from any discovered peer\n");
     } else {
@@ -110,7 +94,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
-    // Dial the bootstrap node to seed the DHT
     let bootstrap: Multiaddr = BOOTSTRAP_ADDR.parse()?;
     match swarm.dial(bootstrap) {
         Ok(_)  => println!("[b] Dialing bootstrap node..."),
@@ -147,9 +130,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
                     }
 
-                    // Parse the peer's Keystone public key from their agent_version.
-                    // Format is "keystone/1.0/<pubkey_hex>" — we split on '/' and take
-                    // the last part. If it's a bootstrap node or unknown, we skip it.
                     let peer_keystone_key = info.agent_version
                         .strip_prefix("keystone/1.0/")
                         .map(|s| s.to_string());
@@ -158,21 +138,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("[i] Peer identity  : {}", &pubkey[..16]);
                     }
 
-                    // Seed the DHT routing table and publish our own
-                    // public key → peer ID record so others can find us by identity.
                     let _ = swarm.behaviour_mut().kad.bootstrap();
-                    let record = libp2p::kad::Record::new(
+
+                    // Publish our identity record: pubkey → peer ID
+                    let id_record = libp2p::kad::Record::new(
                         libp2p::kad::RecordKey::new(&identity.public_key_hex()),
                         swarm.local_peer_id().to_bytes(),
                     );
-                    let _ = swarm.behaviour_mut().kad.put_record(record, libp2p::kad::Quorum::One);
+                    let _ = swarm.behaviour_mut().kad.put_record(id_record, libp2p::kad::Quorum::One);
 
-                    // If --find was requested, fire the DHT lookup now that we have
-                    // at least one peer in our routing table
+                    // Publish our revocation record if --revoke was passed
+                    if revoke_mode && !revoke_published {
+                        let revocation = create_revocation(&identity, "Key compromised by owner");
+                        let value = serde_json::to_vec(&revocation).unwrap_or_default();
+                        let rev_record = libp2p::kad::Record::new(
+                            libp2p::kad::RecordKey::new(&revocation_dht_key(&identity.public_key_hex())),
+                            value,
+                        );
+                        let _ = swarm.behaviour_mut().kad.put_record(rev_record, libp2p::kad::Quorum::One);
+                        println!("[!] Revocation published to DHT. Keep this node running briefly to propagate.");
+                        revoke_published = true;
+                    }
+
+                    // Fire --find once — we only need one result, not one per peer
                     if let Some(ref key) = find_key {
-                        let dht_key = libp2p::kad::RecordKey::new(key);
-                        swarm.behaviour_mut().kad.get_record(dht_key);
-                        println!("[?] DHT query fired — waiting for result...");
+                        if find_query_id.is_none() {
+                            let dht_key = libp2p::kad::RecordKey::new(key);
+                            find_query_id = Some(swarm.behaviour_mut().kad.get_record(dht_key));
+                            println!("[?] DHT query fired — waiting for result...");
+                        }
                     }
 
                     if query_mode && requested.insert(peer_id) {
@@ -203,6 +197,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Ok(p) = serde_json::from_str::<FollowPayload>(&record.content) {
                                     println!("      follower : {}", &p.follower[..16]);
                                     println!("      followee : {}", &p.followee[..16]);
+
+                                    // Fire revocation checks for both parties.
+                                    // Results come back async via the Kad handler below.
+                                    let fk = libp2p::kad::RecordKey::new(&revocation_dht_key(&p.follower));
+                                    let qid = swarm.behaviour_mut().kad.get_record(fk);
+                                    revocation_checks.insert(qid, p.follower.clone());
+
+                                    let fk = libp2p::kad::RecordKey::new(&revocation_dht_key(&p.followee));
+                                    let qid = swarm.behaviour_mut().kad.get_record(fk);
+                                    revocation_checks.insert(qid, p.followee.clone());
+
+                                    println!("      [~] Checking revocation status...");
                                 }
                             }
                             Err(e) => println!("  [✗] Invalid signature: {e}"),
@@ -217,31 +223,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("[!] Request to {peer} failed: {error}");
                 }
 
-                // DHT query result — someone looked up a public key
                 KeystoneBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
+                    id,
                     result: kad::QueryResult::GetRecord(result),
                     step,
                     ..
                 }) => {
-                    match result {
-                        Ok(kad::GetRecordOk::FoundRecord(record)) if step.last => {
-                            match PeerId::from_bytes(&record.record.value) {
-                                Ok(found_peer_id) => {
-                                    let key_str = String::from_utf8_lossy(record.record.key.as_ref());
-                                    println!("\n[✓] Identity found on network!");
-                                    println!("    Public key : {}...", &key_str[..16.min(key_str.len())]);
-                                    println!("    Peer ID    : {found_peer_id}");
-                                    println!("    → Connect to this peer to interact with them.\n");
+                    if !step.last { continue; }
+
+                    if let Some(pubkey) = revocation_checks.remove(&id) {
+                        // Revocation check result for a key in a received follow record
+                        match result {
+                            Ok(kad::GetRecordOk::FoundRecord(record)) => {
+                                println!("\n  [!] WARNING: key {}... may be REVOKED", &pubkey[..16]);
+                                if let Ok(signed) = serde_json::from_slice::<SignedMessage>(&record.record.value) {
+                                    if signed.verify().is_ok() {
+                                        if let Ok(p) = serde_json::from_str::<RevocationPayload>(&signed.content) {
+                                            println!("      Reason    : {}", p.reason);
+                                            println!("      Revoked at: {} (unix)", p.timestamp);
+                                        }
+                                    } else {
+                                        println!("      (revocation signature invalid — record ignored)");
+                                    }
                                 }
-                                Err(_) => println!("[!] Found record but could not decode peer ID."),
                             }
+                            _ => {} // not revoked — silent
                         }
-                        Ok(_) => {}
-                        Err(kad::GetRecordError::NotFound { .. }) => {
-                            println!("[✗] Identity not found on the network.");
-                            println!("    They may be offline or haven't published yet.");
+                    } else if find_query_id == Some(id) {
+                        // --find result
+                        match result {
+                            Ok(kad::GetRecordOk::FoundRecord(record)) => {
+                                match PeerId::from_bytes(&record.record.value) {
+                                    Ok(found_peer_id) => {
+                                        let key_str = String::from_utf8_lossy(record.record.key.as_ref());
+                                        println!("\n[✓] Identity found on network!");
+                                        println!("    Public key : {}...", &key_str[..16.min(key_str.len())]);
+                                        println!("    Peer ID    : {found_peer_id}");
+                                        println!("    → Connect to this peer to interact with them.\n");
+                                    }
+                                    Err(_) => println!("[!] Found record but could not decode peer ID."),
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(kad::GetRecordError::NotFound { .. }) => {
+                                println!("[✗] Identity not found on the network.");
+                                println!("    They may be offline or haven't published yet.");
+                            }
+                            Err(e) => println!("[!] DHT lookup error: {e:?}"),
                         }
-                        Err(e) => println!("[!] DHT lookup error: {e:?}"),
                     }
                 }
 
