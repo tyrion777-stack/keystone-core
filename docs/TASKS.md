@@ -31,12 +31,12 @@
 ## Phase 3 — Identity on the Network ← CURRENT
 *Goal: your keypair IS your presence on the network — not a random peer ID*
 
-- [ ] Node loads identity from disk on startup (not a throwaway keypair)
-- [ ] Node announces Keystone public key via the identify protocol
-- [ ] DHT stores public key → network address mapping
+- [x] Node loads identity from disk on startup (not a throwaway keypair)
+- [x] Node announces Keystone public key via the identify protocol
+- [x] DHT stores public key → network address mapping
       (look someone up by their public key, not just a peer ID)
-- [ ] Follow records served by a node are tied to its real identity
-- [ ] DHT revocation records
+- [x] Follow records served by a node are tied to its real identity
+- [x] DHT revocation records
       (publish signed notice when a key is compromised — verifiers check before accepting)
 - [ ] Per-app subkeys
       (derive different keypair per platform from one master — stops cross-platform tracking)
