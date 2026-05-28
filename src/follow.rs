@@ -87,3 +87,40 @@ impl FollowStore {
         self.records.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revocation_signature_verifies() {
+        let identity = Identity::generate();
+        let record = create_revocation(&identity, "test revocation");
+        assert!(record.verify().is_ok());
+    }
+
+    #[test]
+    fn revocation_payload_contains_correct_key() {
+        let identity = Identity::generate();
+        let record = create_revocation(&identity, "compromised");
+        let payload: RevocationPayload = serde_json::from_str(&record.content).unwrap();
+        assert_eq!(payload.revoked_key, identity.public_key_hex());
+        assert_eq!(payload.reason, "compromised");
+    }
+
+    #[test]
+    fn tampered_revocation_fails_verification() {
+        let identity = Identity::generate();
+        let mut record = create_revocation(&identity, "legit");
+        // Swap in a different key's signature
+        let other = Identity::generate();
+        record.author = other.public_key_hex();
+        assert!(record.verify().is_err());
+    }
+
+    #[test]
+    fn revocation_dht_key_has_correct_format() {
+        let key = revocation_dht_key("abc123");
+        assert_eq!(key, "revoked:abc123");
+    }
+}
