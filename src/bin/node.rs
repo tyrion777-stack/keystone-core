@@ -58,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let libp2p_keypair = keypair_from_identity(&identity)?;
     let agent = format!("keystone/1.0/{}", identity.public_key_hex());
     let mut swarm = build_swarm_with_keypair(libp2p_keypair, &agent)?;
+    swarm.behaviour_mut().kad.set_mode(Some(kad::Mode::Server));
     let mut store = FollowStore::new();
     let mut dialed: HashSet<PeerId> = HashSet::new();
     let mut requested: HashSet<PeerId> = HashSet::new();
@@ -229,12 +230,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     step,
                     ..
                 }) => {
-                    if !step.last { continue; }
-
-                    if let Some(pubkey) = revocation_checks.remove(&id) {
-                        // Revocation check result for a key in a received follow record
-                        match result {
-                            Ok(kad::GetRecordOk::FoundRecord(record)) => {
+                    match result {
+                        // A record was found — act immediately regardless of step.last.
+                        // For revocation: warn and remove from pending map.
+                        // For --find: print result (deduplicated by clearing find_query_id).
+                        Ok(kad::GetRecordOk::FoundRecord(record)) => {
+                            if let Some(pubkey) = revocation_checks.remove(&id) {
                                 println!("\n  [!] WARNING: key {}... may be REVOKED", &pubkey[..16]);
                                 if let Ok(signed) = serde_json::from_slice::<SignedMessage>(&record.record.value) {
                                     if signed.verify().is_ok() {
@@ -246,13 +247,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         println!("      (revocation signature invalid — record ignored)");
                                     }
                                 }
-                            }
-                            _ => {} // not revoked — silent
-                        }
-                    } else if find_query_id == Some(id) {
-                        // --find result
-                        match result {
-                            Ok(kad::GetRecordOk::FoundRecord(record)) => {
+                            } else if find_query_id == Some(id) {
+                                find_query_id = None; // prevent duplicate prints
                                 match PeerId::from_bytes(&record.record.value) {
                                     Ok(found_peer_id) => {
                                         let key_str = String::from_utf8_lossy(record.record.key.as_ref());
@@ -264,13 +260,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     Err(_) => println!("[!] Found record but could not decode peer ID."),
                                 }
                             }
-                            Ok(_) => {}
-                            Err(kad::GetRecordError::NotFound { .. }) => {
+                        }
+
+                        // Query finished with no record — only care about the final step.
+                        Ok(_) => {
+                            if step.last {
+                                revocation_checks.remove(&id); // clean up, key is not revoked
+                            }
+                        }
+
+                        Err(kad::GetRecordError::NotFound { .. }) if step.last => {
+                            if revocation_checks.remove(&id).is_none() && find_query_id == Some(id) {
                                 println!("[✗] Identity not found on the network.");
                                 println!("    They may be offline or haven't published yet.");
                             }
-                            Err(e) => println!("[!] DHT lookup error: {e:?}"),
                         }
+
+                        Err(e) if step.last => println!("[!] DHT lookup error: {e:?}"),
+
+                        _ => {}
                     }
                 }
 
