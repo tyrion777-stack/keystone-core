@@ -1,6 +1,7 @@
-// Measures Keystone P2P throughput vs plain HTTP on loopback.
-// Keystone: TCP + Noise encryption + Yamux multiplexing + CBOR framing
-// HTTP    : plain TCP, minimal HTTP/1.1 framing (no TLS)
+// Measures Keystone throughput on three transports vs plain HTTP.
+//   KS/TCP  : TCP + Noise encryption + Yamux multiplexing + CBOR framing
+//   KS/QUIC : QUIC (TLS built-in, native stream multiplexing) + CBOR framing
+//   HTTP    : plain TCP, minimal HTTP/1.1 framing (no TLS)
 // 3 trials per size, median reported.
 
 use std::{
@@ -31,71 +32,89 @@ const SIZES: &[(usize, &str)] = &[
     (50_000_000, "50 MB"),
 ];
 
+const TCP_ADDR:  &str = "/ip4/127.0.0.1/tcp/0";
+const QUIC_ADDR: &str = "/ip4/127.0.0.1/udp/0/quic-v1";
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\nKeystone vs HTTP — Throughput Benchmark (loopback, {} trials/size)", TRIALS);
-    println!("Keystone: TCP + Noise + Yamux + CBOR  |  HTTP: plain TCP, no TLS\n");
+    println!("\nKeystone transport benchmark (loopback, {} trials/size, median)", TRIALS);
+    println!("TCP  = TCP + Noise + Yamux + CBOR");
+    println!("QUIC = QUIC (TLS built-in, native streams) + CBOR");
+    println!("HTTP = plain TCP, no TLS\n");
 
-    println!("{:<10}  {:>14}  {:>14}  {:>8}", "Size", "Keystone", "HTTP (no TLS)", "KS/HTTP");
-    println!("{}", "─".repeat(54));
+    println!(
+        "{:<10}  {:>12}  {:>12}  {:>12}  {:>8}",
+        "Size", "KS/TCP", "KS/QUIC", "HTTP (no TLS)", "QUIC/TCP"
+    );
+    println!("{}", "─".repeat(62));
 
     for &(size, label) in SIZES {
         let data: Vec<u8> = (0u8..=255).cycle().take(size).collect();
-        let mut ks_times: Vec<Duration> = Vec::new();
+
+        let mut tcp_times:  Vec<Duration> = Vec::new();
+        let mut quic_times: Vec<Duration> = Vec::new();
         let mut http_times: Vec<Duration> = Vec::new();
 
         for t in 0..TRIALS {
             print!("  {} trial {}/{}  ", label, t + 1, TRIALS);
-            let k = bench_keystone(&data).await?;
-            let h = bench_http(&data).await?;
-            println!("ks={}ms  http={}ms", k.as_millis(), h.as_millis());
-            ks_times.push(k);
-            http_times.push(h);
+            let tcp  = bench_keystone(&data, TCP_ADDR).await?;
+            let quic = bench_keystone(&data, QUIC_ADDR).await?;
+            let http = bench_http(&data).await?;
+            println!("tcp={}ms  quic={}ms  http={}ms",
+                tcp.as_millis(), quic.as_millis(), http.as_millis());
+            tcp_times.push(tcp);
+            quic_times.push(quic);
+            http_times.push(http);
         }
 
-        ks_times.sort();
+        tcp_times.sort();
+        quic_times.sort();
         http_times.sort();
-        let ks = ks_times[TRIALS / 2];
+        let tcp  = tcp_times[TRIALS / 2];
+        let quic = quic_times[TRIALS / 2];
         let http = http_times[TRIALS / 2];
 
-        let ks_mbs   = size as f64 / ks.as_secs_f64()   / 1_000_000.0;
+        let tcp_mbs  = size as f64 / tcp.as_secs_f64()  / 1_000_000.0;
+        let quic_mbs = size as f64 / quic.as_secs_f64() / 1_000_000.0;
         let http_mbs = size as f64 / http.as_secs_f64() / 1_000_000.0;
-        let ratio    = ks_mbs / http_mbs * 100.0;
+        let ratio    = quic_mbs / tcp_mbs * 100.0;
 
         println!(
-            "{:<10}  {:>14}  {:>14}  {:>7.0}%",
+            "{:<10}  {:>12}  {:>12}  {:>12}  {:>7.0}%",
             label,
-            format!("{:.1} MB/s", ks_mbs),
+            format!("{:.1} MB/s", tcp_mbs),
+            format!("{:.1} MB/s", quic_mbs),
             format!("{:.1} MB/s", http_mbs),
             ratio,
         );
         println!();
     }
 
-    println!("100% = same speed as unencrypted HTTP. QUIC will narrow the gap on small files.");
+    println!("QUIC/TCP: 100% = same speed. >100% = QUIC is faster.");
     Ok(())
 }
 
 // ── Keystone benchmark ────────────────────────────────────────────────────────
-// Two in-process swarms connected over loopback.
+// Two in-process swarms connected over loopback on the given transport address.
 // Times from swarm.dial() call to Blake3 verify_complete().
 
-async fn bench_keystone(data: &[u8]) -> Result<Duration, Box<dyn std::error::Error>> {
+async fn bench_keystone(data: &[u8], listen_addr: &str) -> Result<Duration, Box<dyn std::error::Error>> {
     let id = RUN_ID.fetch_add(1, Ordering::SeqCst);
     let pub_dir = format!("/tmp/ks_bench_{id}_pub");
     let fet_dir = format!("/tmp/ks_bench_{id}_fet");
 
-    // Publisher — store the file
     let pub_store = ContentStore::new(&pub_dir)?;
     let hash = pub_store.store(data)?;
 
     let (addr_tx, addr_rx) = oneshot::channel::<Multiaddr>();
 
-    let pub_dir2 = pub_dir.clone();
+    let pub_dir2    = pub_dir.clone();
+    let listen_addr = listen_addr.to_string();
+
     let pub_task = tokio::spawn(async move {
         let store = ContentStore::new(&pub_dir2).unwrap();
         let mut swarm = build_swarm().unwrap();
-        swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+        swarm.listen_on(listen_addr.parse().unwrap()).unwrap();
         let mut addr_tx = Some(addr_tx);
         loop {
             match swarm.select_next_some().await {
@@ -133,10 +152,8 @@ async fn bench_keystone(data: &[u8]) -> Result<Duration, Box<dyn std::error::Err
         }
     });
 
-    // Fetcher — dial and time the transfer
     let pub_addr = addr_rx.await?;
     let mut swarm = build_swarm()?;
-    // Fetcher only dials out — no listener needed.
 
     let start = std::time::Instant::now();
     swarm.dial(pub_addr)?;
@@ -167,7 +184,6 @@ async fn bench_keystone(data: &[u8]) -> Result<Duration, Box<dyn std::error::Err
                         let rec = fet_store.begin_fetch(&h, total_size, chunk_size)?;
                         let n = rec.chunks.len();
                         active = Some(rec);
-                        // Fire all remaining chunk requests immediately
                         if n > 1 {
                             let p = pub_peer.unwrap();
                             for i in 1..n as u64 {
@@ -193,8 +209,6 @@ async fn bench_keystone(data: &[u8]) -> Result<Duration, Box<dyn std::error::Err
         }
     };
 
-    // Abort and wait — ensures the publisher swarm is fully dropped before
-    // the next benchmark run starts, preventing leftover TCP sockets.
     pub_task.abort();
     let _ = pub_task.await;
     let _ = std::fs::remove_dir_all(&pub_dir);
@@ -215,9 +229,8 @@ async fn bench_http(data: &[u8]) -> Result<Duration, Box<dyn std::error::Error>>
 
     tokio::spawn(async move {
         if let Ok((mut conn, _)) = listener.accept().await {
-            // Read the request before responding. Dropping with unread data in
-            // the receive buffer causes the kernel to send RST instead of FIN,
-            // which the client sees as ConnectionReset on large transfers.
+            // Read request before responding — dropping with unread data sends RST
+            // instead of FIN, causing ConnectionReset on the client for large files.
             let mut req_buf = vec![0u8; 512];
             let _ = conn.read(&mut req_buf).await;
             let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\n\r\n");

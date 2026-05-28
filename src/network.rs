@@ -64,6 +64,7 @@ pub fn build_swarm_with_keypair(
             noise::Config::new,
             yamux::Config::default,
         )?
+        .with_quic()
         .with_behaviour(|key| {
             let peer_id = key.public().to_peer_id();
             let store = MemoryStore::new(peer_id);

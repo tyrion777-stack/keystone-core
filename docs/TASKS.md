@@ -76,7 +76,15 @@
 ## Phase 5 — Transport & Security Hardening ← CURRENT
 *Goal: production-grade performance and privacy*
 
-- [ ] QUIC transport (replace TCP — faster handshakes, better on mobile)
+- [x] QUIC transport (TCP kept as fallback, nodes now listen on both)
+      Benchmark results vs TCP (loopback, release, 3-trial median):
+        100 KB : TCP  0.5 MB/s → QUIC  1.0 MB/s  (2× faster,  handshake wins)
+        1 MB   : TCP  2.6 MB/s → QUIC  5.8 MB/s  (2.25× faster)
+        10 MB  : TCP 29.5 MB/s → QUIC 31.8 MB/s  (1.08× faster)
+        50 MB  : TCP 67.4 MB/s → QUIC 95.9 MB/s  (1.42× faster)
+      QUIC wins hardest on small files (handshake is ~2× cheaper than
+      Noise XX + Yamux + multistream negotiation). Throughput also wins at
+      50 MB because QUIC's stream multiplexing has less head-of-line blocking.
 - [ ] Relay nodes (neither peer exposes their IP to the other)
 - [ ] Session keys (forward secrecy — past messages safe if key leaks later)
 - [ ] Content encryption (X25519 — signing proves authenticity, encryption proves privacy)
