@@ -49,7 +49,7 @@
 
 ---
 
-## Phase 4 — Content Layer ← CURRENT
+## Phase 4 — Content Layer ✓ DONE
 *Goal: files stored and retrieved by hash — no server, no URL that can break*
 
 - [x] ContentStore — store blobs by Blake3 hash on disk
@@ -60,11 +60,20 @@
       any-order writes, Blake3 verified on completion
 - [x] Resume interrupted transfers — .meta sidecar tracks ChunkState per chunk,
       restart requests only Pending chunks
-- [ ] Latency benchmark vs plain HTTP
+- [x] Latency benchmark vs plain HTTP
+      Results (loopback, release, 3-trial median):
+        100 KB : Keystone  0.4 MB/s | HTTP 136 MB/s   — handshake dominates
+        1 MB   : Keystone  2.5 MB/s | HTTP 1026 MB/s  — handshake still dominates
+        10 MB  : Keystone 26.7 MB/s | HTTP 1244 MB/s  — 2% of raw TCP
+        50 MB  : Keystone 75.6 MB/s | HTTP 1368 MB/s  — 6% of raw TCP
+      HTTP is unencrypted loopback (kernel memory-copy speed, not real-world).
+      Key finding: connection setup (Noise XX + Yamux + multistream) costs ~250ms.
+      QUIC's 1-RTT handshake will close most of the gap on small files.
+      Throughput at 50 MB (75 MB/s) already exceeds typical internet bandwidth.
 
 ---
 
-## Phase 5 — Transport & Security Hardening
+## Phase 5 — Transport & Security Hardening ← CURRENT
 *Goal: production-grade performance and privacy*
 
 - [ ] QUIC transport (replace TCP — faster handshakes, better on mobile)
