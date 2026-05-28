@@ -12,7 +12,6 @@ use libp2p::{identify, kad, mdns, request_response, swarm::SwarmEvent, Multiaddr
 
 const BOOTSTRAP_ADDR: &str = "/ip4/124.43.78.112/tcp/9000/p2p/12D3KooWCruYnFTDrFoNPtHpaGPcWm4NvfzjyS7uVqWCBimievS2";
 const DEFAULT_KEY_FILE: &str = "keystone.key";
-const CONTENT_DIR: &str = "content";
 
 fn load_or_create_identity(path: &PathBuf) -> Result<Identity, Box<dyn std::error::Error>> {
     if path.exists() {
@@ -104,7 +103,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut swarm = build_swarm_with_keypair(libp2p_keypair, &agent)?;
     swarm.behaviour_mut().kad.set_mode(Some(kad::Mode::Server));
 
-    let content_store = ContentStore::new(CONTENT_DIR)?;
+    // Each node gets its own content directory derived from the key file name.
+    // Prevents two nodes running in the same directory from clobbering each
+    // other's files during fetch (begin_fetch truncates the file to pre-allocate).
+    let content_dir = key_path
+        .file_stem()
+        .map(|s| format!("{}_content", s.to_string_lossy()))
+        .unwrap_or_else(|| "content".to_string());
+    let content_store = ContentStore::new(&content_dir)?;
     let mut follow_store = FollowStore::new();
     let mut dialed: HashSet<PeerId> = HashSet::new();
     let mut requested: HashSet<PeerId> = HashSet::new();
@@ -326,7 +332,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match response.data {
                         Some(bytes) => {
                             match content_store.store(&bytes) {
-                                Ok(hash) => println!("[✓] Content from {peer} saved: {CONTENT_DIR}/{hash}"),
+                                Ok(hash) => println!("[✓] Content from {peer} saved: {content_dir}/{hash}"),
                                 Err(e)   => println!("[!] Failed to store content: {e}"),
                             }
                         }
@@ -419,12 +425,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     println!("\n[✓] Transfer complete and verified!");
                                     println!("    Hash : {hash}");
                                     println!("    Size : {total_size} bytes");
-                                    println!("    Saved: {CONTENT_DIR}/{hash}\n");
+                                    println!("    Saved: {content_dir}/{hash}\n");
                                 } else {
                                     active_fetches.remove(&hash);
                                     fetch_peers.remove(&hash);
-                                    let _ = std::fs::remove_file(format!("{CONTENT_DIR}/{hash}"));
-                                    let _ = std::fs::remove_file(format!("{CONTENT_DIR}/{hash}.meta"));
+                                    let _ = std::fs::remove_file(format!("{content_dir}/{hash}"));
+                                    let _ = std::fs::remove_file(format!("{content_dir}/{hash}.meta"));
                                     println!("[✗] Hash mismatch after reassembly — file discarded");
                                 }
                             }
