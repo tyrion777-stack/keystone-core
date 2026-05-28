@@ -52,10 +52,10 @@
 ## Phase 4 — Content Layer ← CURRENT
 *Goal: files stored and retrieved by hash — no server, no URL that can break*
 
-- [ ] ContentStore — store blobs by Blake3 hash
-- [ ] Publish content to DHT (hash → peer address mapping)
-- [ ] Query content by hash — retrieve from any peer holding it
-- [ ] Send arbitrary files between peers
+- [x] ContentStore — store blobs by Blake3 hash on disk
+- [x] Publish content to DHT (hash → peer address mapping)
+- [x] Query content by hash — retrieve from any peer holding it
+- [x] Send arbitrary files between peers
 - [ ] Chunked transfer for large files (BitTorrent-style)
 - [ ] Resume interrupted transfers
 - [ ] Latency benchmark vs plain HTTP
