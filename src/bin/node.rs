@@ -357,9 +357,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     Ok(publisher_peer_id) => {
                                         println!("[✓] Content found on DHT — publisher: {publisher_peer_id}");
                                         if publisher_peer_id == *swarm.local_peer_id() {
-                                            // We published it ourselves
                                             println!("[i] We are the publisher — file is in {CONTENT_DIR}/{hash}");
+                                        } else if swarm.is_connected(&publisher_peer_id) {
+                                            // Already connected — DHT lookup finished after the connection
+                                            // was established, so ConnectionEstablished already fired.
+                                            // Send the request directly.
+                                            println!("[>] Requesting content from {publisher_peer_id}");
+                                            swarm.behaviour_mut().content.send_request(
+                                                &publisher_peer_id,
+                                                ContentRequest { hash },
+                                            );
                                         } else {
+                                            // Not connected yet — dial and wait for ConnectionEstablished
                                             pending_fetches
                                                 .entry(publisher_peer_id)
                                                 .or_default()
