@@ -24,3 +24,21 @@ pub struct ContentRequest {
 pub struct ContentResponse {
     pub data: Option<Vec<u8>>,
 }
+
+/// Request one chunk of a file by hash and chunk index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkRequest {
+    pub hash: String,
+    pub chunk_index: u64,
+}
+
+/// One chunk of a file. Carries total_size and chunk_size so the receiver
+/// can set up their ContentRecord from the first response alone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkResponse {
+    pub hash: String,
+    pub chunk_index: u64,
+    pub total_size: u64,
+    pub chunk_size: u64,
+    pub data: Option<Vec<u8>>,
+}

@@ -2,11 +2,11 @@ use std::{collections::{HashMap, HashSet}, path::PathBuf};
 
 use futures::StreamExt;
 use keystone_core::{
-    content::{content_dht_key, ContentStore},
+    content::{content_dht_key, ContentRecord, ContentStore},
     follow::{create_follow, create_revocation, revocation_dht_key, FollowPayload, FollowStore, RevocationPayload},
     identity::{Identity, SignedMessage},
     network::{build_swarm_with_keypair, keypair_from_identity, KeystoneBehaviourEvent},
-    protocol::{ContentRequest, ContentResponse, FollowRequest, FollowResponse},
+    protocol::{ChunkRequest, ChunkResponse, ContentResponse, FollowRequest, FollowResponse},
 };
 use libp2p::{identify, kad, mdns, request_response, swarm::SwarmEvent, Multiaddr, PeerId};
 
@@ -35,6 +35,40 @@ fn load_or_create_identity(path: &PathBuf) -> Result<Identity, Box<dyn std::erro
     }
 }
 
+fn start_chunk_fetch(
+    swarm: &mut libp2p::Swarm<keystone_core::network::KeystoneBehaviour>,
+    content_store: &ContentStore,
+    hash: &str,
+    publisher: PeerId,
+    active_fetches: &mut HashMap<String, ContentRecord>,
+    fetch_peers: &mut HashMap<String, PeerId>,
+    pending_fetches: &mut HashMap<PeerId, Vec<String>>,
+) {
+    // Resume: if we already have a partial record, request only pending chunks.
+    // Otherwise, just request chunk 0 — the response tells us total_size and
+    // chunk_size, which we need before we can set up the full ContentRecord.
+    fetch_peers.insert(hash.to_string(), publisher);
+
+    if let Some(record) = content_store.load_meta(hash) {
+        let pending = record.pending_chunks();
+        println!("[~] Resuming fetch — {} chunk(s) remaining", pending.len());
+        active_fetches.insert(hash.to_string(), record);
+        if swarm.is_connected(&publisher) {
+            for idx in pending {
+                swarm.behaviour_mut().chunks.send_request(&publisher, ChunkRequest { hash: hash.to_string(), chunk_index: idx });
+            }
+        } else {
+            pending_fetches.entry(publisher).or_default().push(hash.to_string());
+            let _ = swarm.dial(publisher);
+        }
+    } else if swarm.is_connected(&publisher) {
+        swarm.behaviour_mut().chunks.send_request(&publisher, ChunkRequest { hash: hash.to_string(), chunk_index: 0 });
+    } else {
+        pending_fetches.entry(publisher).or_default().push(hash.to_string());
+        let _ = swarm.dial(publisher);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -50,12 +84,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .find(|w| w[0] == "--follow")
         .map(|w| w[1].clone());
 
-    // --publish <filepath>  →  hash file, store locally, announce to DHT
     let publish_path: Option<PathBuf> = args.windows(2)
         .find(|w| w[0] == "--publish")
         .map(|w| PathBuf::from(&w[1]));
 
-    // --fetch <hash>  →  find who has it via DHT, pull the bytes, save to file
     let fetch_hash: Option<String> = args.windows(2)
         .find(|w| w[0] == "--fetch")
         .map(|w| w[1].clone());
@@ -81,18 +113,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut revocation_checks: HashMap<kad::QueryId, String> = HashMap::new();
     let mut revoke_published = false;
 
-    // content:<hash> DHT lookup → we need the hash back when result arrives
+    // DHT query id → hash being fetched
     let mut content_fetch_queries: HashMap<kad::QueryId, String> = HashMap::new();
-    // peer we need to fetch from once connected: peer_id → [hashes]
+    // hash → in-progress ContentRecord
+    let mut active_fetches: HashMap<String, ContentRecord> = HashMap::new();
+    // hash → peer we're fetching from
+    let mut fetch_peers: HashMap<String, PeerId> = HashMap::new();
+    // peer → hashes to fetch once connected
     let mut pending_fetches: HashMap<PeerId, Vec<String>> = HashMap::new();
 
     println!("\n=== Keystone Node ===");
     println!("Public key : {}", identity.public_key_hex());
     println!("Peer ID    : {}", swarm.local_peer_id());
 
-    // Publish a file if --publish was passed.
-    // We do this before connecting to the network — the file is stored
-    // locally now and announced to the DHT once we have peers.
     let publish_hash: Option<String> = if let Some(ref path) = publish_path {
         let bytes = std::fs::read(path)?;
         let hash = content_store.store(&bytes)?;
@@ -120,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(ref hash) = fetch_hash {
-        println!("\n[?] Will fetch content: {}...", &hash[..16.min(hash.len())]);
+        println!("\n[?] Will fetch: {}...", &hash[..16.min(hash.len())]);
     }
 
     if query_mode {
@@ -147,11 +180,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                // If we were waiting to fetch content from this peer, send the requests now.
                 if let Some(hashes) = pending_fetches.remove(&peer_id) {
                     for hash in hashes {
-                        println!("[>] Requesting content {hash} from {peer_id}");
-                        swarm.behaviour_mut().content.send_request(&peer_id, ContentRequest { hash });
+                        println!("[>] Requesting chunk 0 of {hash} from {peer_id}");
+                        swarm.behaviour_mut().chunks.send_request(&peer_id, ChunkRequest { hash, chunk_index: 0 });
                     }
                 }
             }
@@ -183,14 +215,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let _ = swarm.behaviour_mut().kad.bootstrap();
 
-                    // Publish identity record: pubkey → peer ID
                     let id_record = libp2p::kad::Record::new(
                         libp2p::kad::RecordKey::new(&identity.public_key_hex()),
                         swarm.local_peer_id().to_bytes(),
                     );
                     let _ = swarm.behaviour_mut().kad.put_record(id_record, libp2p::kad::Quorum::One);
 
-                    // Announce content to DHT now that we have routing
                     if let Some(ref hash) = publish_hash {
                         let content_record = libp2p::kad::Record::new(
                             libp2p::kad::RecordKey::new(&content_dht_key(hash)),
@@ -208,7 +238,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             value,
                         );
                         let _ = swarm.behaviour_mut().kad.put_record(rev_record, libp2p::kad::Quorum::One);
-                        println!("[!] Revocation published to DHT. Keep this node running briefly to propagate.");
+                        println!("[!] Revocation published to DHT.");
                         revoke_published = true;
                     }
 
@@ -220,7 +250,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    // Fire content fetch DHT lookup once we have routing
                     if let Some(ref hash) = fetch_hash {
                         if content_fetch_queries.values().all(|h| h != hash) {
                             let dht_key = libp2p::kad::RecordKey::new(&content_dht_key(hash));
@@ -231,7 +260,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     if query_mode && requested.insert(peer_id) {
-                        println!("[>] Connection ready, requesting follows from {peer_id}");
+                        println!("[>] Requesting follows from {peer_id}");
                         swarm.behaviour_mut().follows.send_request(&peer_id, FollowRequest);
                     }
                 }
@@ -242,17 +271,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     peer,
                     message: request_response::Message::Request { channel, .. },
                 }) => {
-                    println!("[<] Follow request from {peer}");
                     let response = FollowResponse { records: follow_store.all().to_vec() };
                     swarm.behaviour_mut().follows.send_response(channel, response).ok();
-                    println!("[>] Sent {} record(s)", follow_store.len());
+                    println!("[<] Follow request from {peer} — sent {} record(s)", follow_store.len());
                 }
 
                 KeystoneBehaviourEvent::Follows(request_response::Event::Message {
                     peer,
                     message: request_response::Message::Response { response, .. },
                 }) => {
-                    println!("\n[<] Received {} follow record(s) from {peer}", response.records.len());
+                    println!("\n[<] {} follow record(s) from {peer}", response.records.len());
                     for record in &response.records {
                         match record.verify() {
                             Ok(()) => {
@@ -260,16 +288,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Ok(p) = serde_json::from_str::<FollowPayload>(&record.content) {
                                     println!("      follower : {}", &p.follower[..16]);
                                     println!("      followee : {}", &p.followee[..16]);
-
                                     let fk = libp2p::kad::RecordKey::new(&revocation_dht_key(&p.follower));
                                     let qid = swarm.behaviour_mut().kad.get_record(fk);
                                     revocation_checks.insert(qid, p.follower.clone());
-
                                     let fk = libp2p::kad::RecordKey::new(&revocation_dht_key(&p.followee));
                                     let qid = swarm.behaviour_mut().kad.get_record(fk);
                                     revocation_checks.insert(qid, p.followee.clone());
-
-                                    println!("      [~] Checking revocation status...");
+                                    println!("      [~] Checking revocation...");
                                 }
                             }
                             Err(e) => println!("  [✗] Invalid signature: {e}"),
@@ -278,27 +303,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!();
                 }
 
-                KeystoneBehaviourEvent::Follows(request_response::Event::OutboundFailure {
-                    peer, error, ..
-                }) => {
+                KeystoneBehaviourEvent::Follows(request_response::Event::OutboundFailure { peer, error, .. }) => {
                     println!("[!] Follow request to {peer} failed: {error}");
                 }
 
-                // --- Content protocol ---
+                // --- Content protocol (small files, backward compat) ---
 
                 KeystoneBehaviourEvent::Content(request_response::Event::Message {
                     peer,
                     message: request_response::Message::Request { request, channel, .. },
                 }) => {
-                    println!("[<] Content request from {peer} : {}", &request.hash[..16.min(request.hash.len())]);
                     let data = content_store.get(&request.hash);
                     let found = data.is_some();
                     swarm.behaviour_mut().content.send_response(channel, ContentResponse { data }).ok();
-                    if found {
-                        println!("[>] Sent content");
-                    } else {
-                        println!("[>] Don't have it");
-                    }
+                    println!("[<] Content request from {peer} — {}", if found { "sent" } else { "not found" });
                 }
 
                 KeystoneBehaviourEvent::Content(request_response::Event::Message {
@@ -307,26 +325,115 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }) => {
                     match response.data {
                         Some(bytes) => {
-                            let hash = hex::encode(blake3::hash(&bytes).as_bytes());
-                            // Save to disk via content store to verify hash integrity
                             match content_store.store(&bytes) {
-                                Ok(stored_hash) if stored_hash == hash => {
-                                    println!("\n[✓] Content received from {peer}");
-                                    println!("    Hash    : {hash}");
-                                    println!("    Size    : {} bytes", bytes.len());
-                                    println!("    Saved to: {CONTENT_DIR}/{hash}\n");
-                                }
-                                _ => println!("[!] Content hash mismatch — discarded"),
+                                Ok(hash) => println!("[✓] Content from {peer} saved: {CONTENT_DIR}/{hash}"),
+                                Err(e)   => println!("[!] Failed to store content: {e}"),
                             }
                         }
-                        None => println!("[!] Peer {peer} does not have the requested content"),
+                        None => println!("[!] Peer {peer} does not have the content"),
                     }
                 }
 
-                KeystoneBehaviourEvent::Content(request_response::Event::OutboundFailure {
-                    peer, error, ..
-                }) => {
+                KeystoneBehaviourEvent::Content(request_response::Event::OutboundFailure { peer, error, .. }) => {
                     println!("[!] Content request to {peer} failed: {error}");
+                }
+
+                // --- Chunked transfer protocol ---
+
+                KeystoneBehaviourEvent::Chunks(request_response::Event::Message {
+                    peer,
+                    message: request_response::Message::Request { request, channel, .. },
+                }) => {
+                    let response = match content_store.serve_chunk(&request.hash, request.chunk_index) {
+                        Some((data, total_size, chunk_size)) => ChunkResponse {
+                            hash: request.hash.clone(),
+                            chunk_index: request.chunk_index,
+                            total_size,
+                            chunk_size,
+                            data: Some(data),
+                        },
+                        None => ChunkResponse {
+                            hash: request.hash.clone(),
+                            chunk_index: request.chunk_index,
+                            total_size: 0,
+                            chunk_size: 0,
+                            data: None,
+                        },
+                    };
+                    swarm.behaviour_mut().chunks.send_response(channel, response).ok();
+                    println!("[<] Chunk {} of {} requested by {peer}", request.chunk_index, &request.hash[..16]);
+                }
+
+                KeystoneBehaviourEvent::Chunks(request_response::Event::Message {
+                    peer,
+                    message: request_response::Message::Response { response, .. },
+                }) => {
+                    let ChunkResponse { hash, chunk_index, total_size, chunk_size, data } = response;
+
+                    match data {
+                        None => {
+                            println!("[!] Peer {peer} doesn't have chunk {chunk_index} of {}...", &hash[..16]);
+                        }
+                        Some(chunk_data) => {
+                            // Set up ContentRecord on first chunk received
+                            if !active_fetches.contains_key(&hash) {
+                                match content_store.begin_fetch(&hash, total_size, chunk_size) {
+                                    Ok(record) => { active_fetches.insert(hash.clone(), record); }
+                                    Err(e) => { println!("[!] begin_fetch failed: {e}"); continue; }
+                                }
+                            }
+
+                            // Write chunk and update state
+                            let (is_done, total_chunks) = {
+                                let record = active_fetches.get_mut(&hash).unwrap();
+                                if let Err(e) = content_store.write_chunk(record, chunk_index, &chunk_data) {
+                                    println!("[!] write_chunk failed: {e}");
+                                }
+                                (record.is_complete(), record.chunks.len())
+                            };
+
+                            let done_count = total_chunks - active_fetches[&hash].pending_chunks().len();
+                            println!("[~] {}... chunk {}/{total_chunks}", &hash[..16], done_count);
+
+                            // On first chunk response, fire requests for all remaining chunks
+                            if chunk_index == 0 && total_chunks > 1 {
+                                let publisher = fetch_peers.get(&hash).copied().unwrap_or(peer);
+                                for i in 1..total_chunks as u64 {
+                                    swarm.behaviour_mut().chunks.send_request(
+                                        &publisher,
+                                        ChunkRequest { hash: hash.clone(), chunk_index: i },
+                                    );
+                                }
+                            }
+
+                            if is_done {
+                                let verified = {
+                                    let record = active_fetches.get(&hash).unwrap();
+                                    content_store.verify_complete(record).unwrap_or(false)
+                                };
+
+                                if verified {
+                                    let record = active_fetches.remove(&hash).unwrap();
+                                    content_store.finish_fetch(&record);
+                                    fetch_peers.remove(&hash);
+                                    println!("\n[✓] Transfer complete and verified!");
+                                    println!("    Hash : {hash}");
+                                    println!("    Size : {total_size} bytes");
+                                    println!("    Saved: {CONTENT_DIR}/{hash}\n");
+                                } else {
+                                    active_fetches.remove(&hash);
+                                    fetch_peers.remove(&hash);
+                                    let _ = std::fs::remove_file(format!("{CONTENT_DIR}/{hash}"));
+                                    let _ = std::fs::remove_file(format!("{CONTENT_DIR}/{hash}.meta"));
+                                    println!("[✗] Hash mismatch after reassembly — file discarded");
+                                }
+                            }
+                        }
+                    }
+                }
+
+                KeystoneBehaviourEvent::Chunks(request_response::Event::OutboundFailure { peer, error, .. }) => {
+                    println!("[!] Chunk request to {peer} failed: {error}");
                 }
 
                 // --- DHT results ---
@@ -348,45 +455,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             println!("      Revoked at: {} (unix)", p.timestamp);
                                         }
                                     } else {
-                                        println!("      (revocation signature invalid — record ignored)");
+                                        println!("      (revocation signature invalid — ignored)");
                                     }
                                 }
                             } else if let Some(hash) = content_fetch_queries.remove(&id) {
-                                // DHT told us who has the content — now connect and fetch
                                 match PeerId::from_bytes(&record.record.value) {
-                                    Ok(publisher_peer_id) => {
-                                        println!("[✓] Content found on DHT — publisher: {publisher_peer_id}");
-                                        if publisher_peer_id == *swarm.local_peer_id() {
-                                            println!("[i] We are the publisher — file is in {CONTENT_DIR}/{hash}");
-                                        } else if swarm.is_connected(&publisher_peer_id) {
-                                            // Already connected — DHT lookup finished after the connection
-                                            // was established, so ConnectionEstablished already fired.
-                                            // Send the request directly.
-                                            println!("[>] Requesting content from {publisher_peer_id}");
-                                            swarm.behaviour_mut().content.send_request(
-                                                &publisher_peer_id,
-                                                ContentRequest { hash },
-                                            );
-                                        } else {
-                                            // Not connected yet — dial and wait for ConnectionEstablished
-                                            pending_fetches
-                                                .entry(publisher_peer_id)
-                                                .or_default()
-                                                .push(hash);
-                                            let _ = swarm.dial(publisher_peer_id);
-                                        }
+                                    Ok(publisher) => {
+                                        println!("[✓] Content on DHT — publisher: {publisher}");
+                                        start_chunk_fetch(
+                                            &mut swarm,
+                                            &content_store,
+                                            &hash,
+                                            publisher,
+                                            &mut active_fetches,
+                                            &mut fetch_peers,
+                                            &mut pending_fetches,
+                                        );
                                     }
-                                    Err(_) => println!("[!] Found content record but could not decode peer ID"),
+                                    Err(_) => println!("[!] Content record found but peer ID unreadable"),
                                 }
                             } else if find_query_id == Some(id) {
                                 find_query_id = None;
                                 match PeerId::from_bytes(&record.record.value) {
                                     Ok(found_peer_id) => {
                                         let key_str = String::from_utf8_lossy(record.record.key.as_ref());
-                                        println!("\n[✓] Identity found on network!");
+                                        println!("\n[✓] Identity found!");
                                         println!("    Public key : {}...", &key_str[..16.min(key_str.len())]);
-                                        println!("    Peer ID    : {found_peer_id}");
-                                        println!("    → Connect to this peer to interact with them.\n");
+                                        println!("    Peer ID    : {found_peer_id}\n");
                                     }
                                     Err(_) => println!("[!] Found record but could not decode peer ID."),
                                 }
@@ -402,16 +497,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         Err(kad::GetRecordError::NotFound { .. }) if step.last => {
                             if let Some(hash) = content_fetch_queries.remove(&id) {
-                                println!("[✗] Content not found on the network: {hash}");
-                                println!("    The publisher may be offline or hasn't announced yet.");
+                                println!("[✗] Content not found on DHT: {}", &hash[..16]);
+                                println!("    Publisher may be offline.");
                             } else if revocation_checks.remove(&id).is_none() && find_query_id == Some(id) {
-                                println!("[✗] Identity not found on the network.");
-                                println!("    They may be offline or haven't published yet.");
+                                println!("[✗] Identity not found.");
                             }
                         }
 
-                        Err(e) if step.last => println!("[!] DHT lookup error: {e:?}"),
-
+                        Err(e) if step.last => println!("[!] DHT error: {e:?}"),
                         _ => {}
                     }
                 }

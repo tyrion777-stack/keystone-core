@@ -9,11 +9,12 @@ use libp2p::{
     tcp, yamux, Swarm, SwarmBuilder, StreamProtocol,
 };
 
-use crate::{identity::Identity, protocol::{ContentRequest, ContentResponse, FollowRequest, FollowResponse}};
+use crate::{identity::Identity, protocol::{ChunkRequest, ChunkResponse, ContentRequest, ContentResponse, FollowRequest, FollowResponse}};
 
 pub const PROTOCOL: &str = "/keystone/1.0.0";
 pub const FOLLOWS_PROTOCOL: &str = "/keystone/follows/1.0";
 pub const CONTENT_PROTOCOL: &str = "/keystone/content/1.0";
+pub const CHUNKS_PROTOCOL: &str = "/keystone/chunks/1.0";
 
 /// Everything a Keystone node knows how to do on the network.
 #[derive(NetworkBehaviour)]
@@ -24,6 +25,7 @@ pub struct KeystoneBehaviour {
     pub mdns: mdns::tokio::Behaviour,
     pub follows: request_response::json::Behaviour<FollowRequest, FollowResponse>,
     pub content: request_response::cbor::Behaviour<ContentRequest, ContentResponse>,
+    pub chunks: request_response::cbor::Behaviour<ChunkRequest, ChunkResponse>,
 }
 
 /// Convert a Keystone identity into a libp2p keypair.
@@ -84,6 +86,13 @@ pub fn build_swarm_with_keypair(
                 content: request_response::cbor::Behaviour::new(
                     [(
                         StreamProtocol::new(CONTENT_PROTOCOL),
+                        ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default(),
+                ),
+                chunks: request_response::cbor::Behaviour::new(
+                    [(
+                        StreamProtocol::new(CHUNKS_PROTOCOL),
                         ProtocolSupport::Full,
                     )],
                     request_response::Config::default(),
