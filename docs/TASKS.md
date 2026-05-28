@@ -56,8 +56,10 @@
 - [x] Publish content to DHT (hash → peer address mapping)
 - [x] Query content by hash — retrieve from any peer holding it
 - [x] Send arbitrary files between peers
-- [ ] Chunked transfer for large files (BitTorrent-style)
-- [ ] Resume interrupted transfers
+- [x] Chunked transfer for large files — dynamic chunk size, pre-allocated,
+      any-order writes, Blake3 verified on completion
+- [x] Resume interrupted transfers — .meta sidecar tracks ChunkState per chunk,
+      restart requests only Pending chunks
 - [ ] Latency benchmark vs plain HTTP
 
 ---
