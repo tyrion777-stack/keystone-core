@@ -85,9 +85,15 @@
       QUIC wins hardest on small files (handshake is ~2× cheaper than
       Noise XX + Yamux + multistream negotiation). Throughput also wins at
       50 MB because QUIC's stream multiplexing has less head-of-line blocking.
-- [ ] Relay nodes (neither peer exposes their IP to the other)
+- [x] Relay nodes (neither peer exposes their IP to the other)
+      Bootstrap node acts as circuit relay server. Regular nodes request a reservation
+      on startup. DCUtR attempts hole-punch to direct QUIC; falls back to relayed traffic.
 - [ ] Session keys (forward secrecy — past messages safe if key leaks later)
-- [ ] Content encryption (X25519 — signing proves authenticity, encryption proves privacy)
+- [x] Content encryption (X25519 — signing proves authenticity, encryption proves privacy)
+      Envelope encryption: random content key per file, wrapped per-recipient via
+      ephemeral X25519 ECDH + HKDF-SHA256 + AES-256-GCM. Each Identity now carries
+      an X25519 keypair. Encrypted blobs stored and transferred identically to
+      unencrypted content. Old key files load cleanly (X25519 derived from Ed25519 seed).
 - [ ] Key rotation protocol (migrate to new keypair if compromised)
 - [ ] Cross-device sync (encrypted key blob via QR code or P2P)
 - [ ] WebAuthn / hardware binding (key lives in device secure enclave)
