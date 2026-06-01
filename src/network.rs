@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use libp2p::{
-    identify, identity, kad,
+    dcutr, identify, identity, kad,
     kad::store::MemoryStore,
-    mdns, noise, ping,
+    mdns, noise, ping, relay,
     request_response::{self, ProtocolSupport},
     swarm::NetworkBehaviour,
     tcp, yamux, Swarm, SwarmBuilder, StreamProtocol,
@@ -26,6 +26,9 @@ pub struct KeystoneBehaviour {
     pub follows: request_response::json::Behaviour<FollowRequest, FollowResponse>,
     pub content: request_response::cbor::Behaviour<ContentRequest, ContentResponse>,
     pub chunks: request_response::cbor::Behaviour<ChunkRequest, ChunkResponse>,
+    pub relay_client: relay::client::Behaviour,
+    pub relay_server: relay::Behaviour,
+    pub dcutr: dcutr::Behaviour,
 }
 
 /// Convert a Keystone identity into a libp2p keypair.
@@ -65,7 +68,8 @@ pub fn build_swarm_with_keypair(
             yamux::Config::default,
         )?
         .with_quic()
-        .with_behaviour(|key| {
+        .with_relay_client(noise::Config::new, yamux::Config::default)?
+        .with_behaviour(|key, relay_client| {
             let peer_id = key.public().to_peer_id();
             let store = MemoryStore::new(peer_id);
 
@@ -98,6 +102,9 @@ pub fn build_swarm_with_keypair(
                     )],
                     request_response::Config::default(),
                 ),
+                relay_client,
+                relay_server: relay::Behaviour::new(peer_id, relay::Config::default()),
+                dcutr: dcutr::Behaviour::new(peer_id),
             })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use futures::StreamExt;
 use keystone_core::network::{build_swarm_with_keypair, KeystoneBehaviourEvent};
-use libp2p::{identify, identity::Keypair, kad, swarm::SwarmEvent};
+use libp2p::{identify, identity::Keypair, kad, relay, swarm::SwarmEvent};
 
 // Where the keypair is saved on disk — stable across restarts.
 // Pass a custom path as the first argument if needed.
@@ -68,14 +68,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             SwarmEvent::Behaviour(event) => {
-                if let KeystoneBehaviourEvent::Identify(
-                    identify::Event::Received { peer_id, info, .. },
-                ) = event
-                {
-                    println!("[i] Identified   : {peer_id}  protocol={}", info.protocol_version);
-                    for addr in info.listen_addrs {
-                        swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                #[allow(deprecated)]
+                match event {
+                    KeystoneBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. }) => {
+                        println!("[i] Identified   : {peer_id}  protocol={}", info.protocol_version);
+                        for addr in info.listen_addrs {
+                            swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                        }
                     }
+                    KeystoneBehaviourEvent::RelayServer(relay::Event::ReservationReqAccepted { src_peer_id, .. }) => {
+                        println!("[r] Relay reservation : {src_peer_id}");
+                    }
+                    KeystoneBehaviourEvent::RelayServer(relay::Event::CircuitReqAccepted { src_peer_id, dst_peer_id }) => {
+                        println!("[r] Circuit accepted  : {src_peer_id} → {dst_peer_id}");
+                    }
+                    KeystoneBehaviourEvent::RelayServer(relay::Event::CircuitClosed { src_peer_id, dst_peer_id, .. }) => {
+                        println!("[r] Circuit closed    : {src_peer_id} ↔ {dst_peer_id}");
+                    }
+                    _ => {}
                 }
             }
 

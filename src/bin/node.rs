@@ -8,9 +8,11 @@ use keystone_core::{
     network::{build_swarm_with_keypair, keypair_from_identity, KeystoneBehaviourEvent},
     protocol::{ChunkRequest, ChunkResponse, ContentResponse, FollowRequest, FollowResponse},
 };
-use libp2p::{identify, kad, mdns, request_response, swarm::SwarmEvent, Multiaddr, PeerId};
+use libp2p::{identify, kad, mdns, relay, request_response, swarm::SwarmEvent, Multiaddr, PeerId};
 
 const BOOTSTRAP_ADDR: &str = "/ip4/124.43.78.112/tcp/9000/p2p/12D3KooWCruYnFTDrFoNPtHpaGPcWm4NvfzjyS7uVqWCBimievS2";
+// Bootstrap node doubles as circuit relay — use it as fallback when behind NAT.
+const RELAY_CIRCUIT_ADDR: &str = "/ip4/124.43.78.112/tcp/9000/p2p/12D3KooWCruYnFTDrFoNPtHpaGPcWm4NvfzjyS7uVqWCBimievS2/p2p-circuit";
 const DEFAULT_KEY_FILE: &str = "keystone.key";
 
 fn load_or_create_identity(path: &PathBuf) -> Result<Identity, Box<dyn std::error::Error>> {
@@ -175,6 +177,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match swarm.dial(bootstrap) {
         Ok(_)  => println!("[b] Dialing bootstrap node..."),
         Err(e) => println!("[b] Bootstrap dial failed: {e} (continuing with mDNS only)"),
+    }
+
+    // Request a relay reservation so peers behind NAT can be reached via the bootstrap relay.
+    let relay_circuit: Multiaddr = RELAY_CIRCUIT_ADDR.parse()?;
+    match swarm.listen_on(relay_circuit) {
+        Ok(_)  => println!("[r] Relay reservation requested..."),
+        Err(e) => println!("[r] Relay reservation failed: {e}"),
     }
 
     loop {
@@ -441,6 +450,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 KeystoneBehaviourEvent::Chunks(request_response::Event::OutboundFailure { peer, error, .. }) => {
                     println!("[!] Chunk request to {peer} failed: {error}");
+                }
+
+                // --- Relay ---
+
+                KeystoneBehaviourEvent::RelayClient(relay::client::Event::ReservationReqAccepted { relay_peer_id, .. }) => {
+                    println!("[r] Relay reservation accepted — routable via {relay_peer_id}");
+                    println!("    Peers behind NAT can now reach this node.");
                 }
 
                 // --- DHT results ---

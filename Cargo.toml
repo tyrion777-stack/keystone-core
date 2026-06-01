@@ -16,7 +16,7 @@ serde_json = "1.0"
 rand = "0.8"
 hex = "0.4"
 thiserror = "1.0"
-libp2p = { version = "0.53", features = ["tcp", "noise", "yamux", "quic", "identify", "ping", "kad", "mdns", "request-response", "json", "cbor", "tokio", "macros"] }
+libp2p = { version = "0.53", features = ["tcp", "noise", "yamux", "quic", "relay", "dcutr", "identify", "ping", "kad", "mdns", "request-response", "json", "cbor", "tokio", "macros"] }
 tokio = { version = "1.0", features = ["full"] }
 futures = "0.3"
 argon2 = "0.5"
