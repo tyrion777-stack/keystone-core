@@ -4,6 +4,7 @@ pub mod network;
 pub mod follow;
 pub mod protocol;
 pub mod content;
+pub mod encryption;
 
 pub use identity::{Identity, SignedMessage};
 pub use error::KeystoneError;

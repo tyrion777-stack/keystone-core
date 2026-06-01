@@ -8,6 +8,8 @@ use argon2::Argon2;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha512};
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 use crate::error::KeystoneError;
 
@@ -18,6 +20,7 @@ const NONCE_LEN: usize = 12;
 /// The public key (verifying_key) is your permanent, portable identity on the network.
 pub struct Identity {
     signing_key: SigningKey,
+    x25519_secret: StaticSecret,
 }
 
 /// A message with a cryptographic proof of authorship.
@@ -37,7 +40,8 @@ impl Identity {
     /// Generate a brand new keypair using OS-level randomness.
     pub fn generate() -> Self {
         let signing_key = SigningKey::generate(&mut OsRng);
-        Self { signing_key }
+        let x25519_secret = StaticSecret::random_from_rng(OsRng);
+        Self { signing_key, x25519_secret }
     }
 
     /// Restore an identity from a previously exported private key (hex string).
@@ -46,9 +50,9 @@ impl Identity {
         let arr: [u8; 32] = bytes
             .try_into()
             .map_err(|_| KeystoneError::InvalidPrivateKey("must be 32 bytes".into()))?;
-        Ok(Self {
-            signing_key: SigningKey::from_bytes(&arr),
-        })
+        let signing_key = SigningKey::from_bytes(&arr);
+        let x25519_secret = derive_x25519(&arr);
+        Ok(Self { signing_key, x25519_secret })
     }
 
     /// The public key as a hex string — this is your Keystone identity.
@@ -62,13 +66,28 @@ impl Identity {
         hex::encode(self.signing_key.to_bytes())
     }
 
+    /// The X25519 public key — share this so others can encrypt content for you.
+    pub fn x25519_public_key(&self) -> X25519PublicKey {
+        X25519PublicKey::from(&self.x25519_secret)
+    }
+
+    /// The X25519 static secret — used to decrypt content encrypted to this identity.
+    pub fn x25519_secret(&self) -> &StaticSecret {
+        &self.x25519_secret
+    }
+
     /// Save the identity to disk, locked with a password.
     /// The file is useless without the password — safe to store anywhere.
+    /// Plaintext format: ed25519_private(32) || x25519_private(32) = 64 bytes.
     pub fn save_encrypted<P: AsRef<Path>>(&self, path: P, password: &str) -> Result<(), KeystoneError> {
         let mut salt = [0u8; SALT_LEN];
         let mut nonce = [0u8; NONCE_LEN];
         OsRng.fill_bytes(&mut salt);
         OsRng.fill_bytes(&mut nonce);
+
+        let mut plaintext = [0u8; 64];
+        plaintext[..32].copy_from_slice(self.signing_key.to_bytes().as_ref());
+        plaintext[32..].copy_from_slice(self.x25519_secret.as_bytes());
 
         let mut enc_key = [0u8; 32];
         Argon2::default()
@@ -77,7 +96,7 @@ impl Identity {
 
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&enc_key));
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce), self.signing_key.to_bytes().as_ref())
+            .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
             .map_err(|e| KeystoneError::KeyStorage(e.to_string()))?;
 
         let mut blob = Vec::with_capacity(SALT_LEN + NONCE_LEN + ciphertext.len());
@@ -89,7 +108,9 @@ impl Identity {
     }
 
     /// Load an identity from a previously saved encrypted file.
-    /// Returns an error if the password is wrong or the file is corrupted.
+    /// Handles both the old format (32-byte plaintext, ed25519 only) and the
+    /// new format (64-byte plaintext, ed25519 || x25519). Old files derive the
+    /// X25519 key from the Ed25519 seed so behaviour is unchanged for existing users.
     pub fn load_encrypted<P: AsRef<Path>>(path: P, password: &str) -> Result<Self, KeystoneError> {
         let blob = std::fs::read(path).map_err(|e| KeystoneError::KeyStorage(e.to_string()))?;
 
@@ -107,15 +128,28 @@ impl Identity {
             .map_err(|e| KeystoneError::KeyStorage(e.to_string()))?;
 
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&enc_key));
-        let private_key_bytes = cipher
+        let plaintext = cipher
             .decrypt(Nonce::from_slice(nonce), ciphertext)
             .map_err(|_| KeystoneError::KeyStorage("wrong password or corrupted file".into()))?;
 
-        let arr: [u8; 32] = private_key_bytes
-            .try_into()
-            .map_err(|_| KeystoneError::KeyStorage("invalid key length in file".into()))?;
+        let (ed_arr, x_secret) = match plaintext.len() {
+            32 => {
+                let arr: [u8; 32] = plaintext.try_into().unwrap();
+                let x = derive_x25519(&arr);
+                (arr, x)
+            }
+            64 => {
+                let ed_arr: [u8; 32] = plaintext[..32].try_into().unwrap();
+                let x_arr: [u8; 32] = plaintext[32..].try_into().unwrap();
+                (ed_arr, StaticSecret::from(x_arr))
+            }
+            _ => return Err(KeystoneError::KeyStorage("invalid key length in file".into())),
+        };
 
-        Ok(Self { signing_key: SigningKey::from_bytes(&arr) })
+        Ok(Self {
+            signing_key: SigningKey::from_bytes(&ed_arr),
+            x25519_secret: x_secret,
+        })
     }
 
     /// Sign a string message. Hashes the content with Blake3 first,
@@ -133,6 +167,19 @@ impl Identity {
             signature: hex::encode(signature.to_bytes()),
         }
     }
+}
+
+/// Deterministically derive an X25519 static secret from an Ed25519 private seed.
+/// Uses SHA-512 of the seed and clamps the first 32 bytes — the same scalar
+/// derivation Ed25519 uses internally, so the two keys share a common root.
+fn derive_x25519(ed25519_seed: &[u8; 32]) -> StaticSecret {
+    let hash = Sha512::digest(ed25519_seed);
+    let mut scalar = [0u8; 32];
+    scalar.copy_from_slice(&hash[..32]);
+    scalar[0] &= 248;
+    scalar[31] &= 127;
+    scalar[31] |= 64;
+    StaticSecret::from(scalar)
 }
 
 impl SignedMessage {
