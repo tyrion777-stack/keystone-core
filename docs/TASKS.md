@@ -101,6 +101,27 @@
 
 ---
 
+## Browser Extension ← NEXT
+*Goal: `window.keystone` on every page — sign in anywhere, no accounts*
+
+Located at `../keystone-extension/` (TypeScript, Vite + crxjs MV3).
+Build: `cd keystone-extension && npm run build` → load `dist/` unpacked in Chrome.
+
+- [x] Key vault — PBKDF2-SHA256 + AES-256-GCM in `chrome.storage.local`
+- [x] Session unlock — seed cached in `chrome.storage.session` for 30 min
+- [x] `window.keystone.getPublicKey()` — returns pubkey hex or null if uninstalled
+- [x] `window.keystone.sign(challenge)` — returns `{ signature, pubkey }`
+      Signing mirrors keystone-core exactly: Blake3(challenge) → hex → Ed25519(hex)
+- [x] Approval popup — shows requesting origin + challenge, password prompt,
+      approve/deny. Wrong password shows inline error, does not close.
+- [x] Popup UI — setup flow (import existing key hex or generate new),
+      backup prompt for generated keys, lock/unlock, pubkey display with copy.
+- [ ] Icons (16/48/128px)
+- [ ] Import from .keystone file (Argon2id compat) — Layer 3
+- [ ] Cross-device sync via QR export/import — Layer 3
+
+---
+
 ## Phase 6 — Ecosystem
 *Goal: Keystone identities work everywhere, not just Keystone apps*
 
