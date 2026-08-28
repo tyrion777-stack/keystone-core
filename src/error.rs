@@ -19,4 +19,10 @@ pub enum KeystoneError {
 
     #[error("Key storage error: {0}")]
     KeyStorage(String),
+
+    #[error("Invalid content hash: {0}")]
+    InvalidHash(String),
+
+    #[error("Invalid chunk parameter: {0}")]
+    InvalidChunk(String),
 }
