@@ -1,1 +1,5 @@
 /target
+*.key
+*.pem
+*.p8
+*.p12
