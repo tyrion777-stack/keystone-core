@@ -47,6 +47,15 @@ impl ContentRecord {
     }
 }
 
+/// Require exactly 64 lowercase hex characters. Rejects path traversal,
+/// absolute paths, empty strings, wrong-case hex, and wrong-length inputs.
+pub fn validate_hash(hash: &str) -> Result<(), KeystoneError> {
+    if hash.len() != 64 || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(KeystoneError::InvalidHash(hash.to_string()));
+    }
+    Ok(())
+}
+
 /// Stores files on disk addressed by their Blake3 hash.
 /// Complete files have no sidecar. In-progress files have a `.meta` sidecar
 /// tracking which chunks are done — that's the resume state.
@@ -75,14 +84,16 @@ impl ContentStore {
 
     /// Retrieve complete file bytes by hash.
     pub fn get(&self, hash: &str) -> Option<Vec<u8>> {
+        validate_hash(hash).ok()?;
         std::fs::read(self.dir.join(hash)).ok()
     }
 
     pub fn has(&self, hash: &str) -> bool {
-        self.dir.join(hash).exists()
+        validate_hash(hash).is_ok() && self.dir.join(hash).exists()
     }
 
     pub fn file_size(&self, hash: &str) -> Option<u64> {
+        validate_hash(hash).ok()?;
         std::fs::metadata(self.dir.join(hash)).ok().map(|m| m.len())
     }
 
@@ -92,6 +103,7 @@ impl ContentStore {
     /// Returns (chunk_bytes, total_size, chunk_size) so the response carries
     /// everything the receiver needs to set up their ContentRecord.
     pub fn serve_chunk(&self, hash: &str, chunk_index: u64) -> Option<(Vec<u8>, u64, u64)> {
+        validate_hash(hash).ok()?;
         let total_size = self.file_size(hash)?;
         let chunk_size = calc_chunk_size(total_size);
         let offset = chunk_index * chunk_size;
@@ -114,6 +126,7 @@ impl ContentStore {
     /// so chunks can be written at their seek positions in any order.
     /// Resumes an existing in-progress fetch if a .meta sidecar already exists.
     pub fn begin_fetch(&self, hash: &str, total_size: u64, chunk_size: u64) -> Result<ContentRecord, KeystoneError> {
+        validate_hash(hash)?;
         // Resume if we have an existing partial fetch
         if let Some(record) = self.load_meta(hash) {
             return Ok(record);
@@ -171,6 +184,7 @@ impl ContentStore {
     }
 
     pub fn load_meta(&self, hash: &str) -> Option<ContentRecord> {
+        validate_hash(hash).ok()?;
         let data = std::fs::read(self.dir.join(format!("{hash}.meta"))).ok()?;
         serde_json::from_slice(&data).ok()
     }
@@ -275,6 +289,68 @@ mod tests {
         assert_eq!(record.pending_chunks(), vec![0]);
         store.write_chunk(&mut record, 0, &data).unwrap();
         assert!(record.pending_chunks().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Hash validation ---
+
+    #[test]
+    fn validate_hash_accepts_real_blake3() {
+        let h = hex::encode(blake3::hash(b"keystone").as_bytes());
+        assert_eq!(h.len(), 64);
+        assert!(validate_hash(&h).is_ok());
+    }
+
+    #[test]
+    fn validate_hash_rejects_absolute_path() {
+        assert!(validate_hash("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn validate_hash_rejects_path_traversal() {
+        assert!(validate_hash("../../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn validate_hash_rejects_empty_string() {
+        assert!(validate_hash("").is_err());
+    }
+
+    #[test]
+    fn validate_hash_rejects_uppercase_hex() {
+        // 64 chars but uppercase — not canonical lowercase hex
+        assert!(validate_hash("ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789").is_err());
+    }
+
+    #[test]
+    fn validate_hash_rejects_63_chars() {
+        assert!(validate_hash(&"a".repeat(63)).is_err());
+    }
+
+    #[test]
+    fn validate_hash_rejects_65_chars() {
+        assert!(validate_hash(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn validate_hash_rejects_non_hex_chars() {
+        // 64 chars but contains '!' — not a valid hex digit
+        let bad: String = std::iter::once('!').chain("a".repeat(63).chars()).collect();
+        assert_eq!(bad.len(), 64);
+        assert!(validate_hash(&bad).is_err());
+    }
+
+    #[test]
+    fn store_methods_reject_traversal_hash() {
+        let dir = tmp("ks_ct_sec");
+        let store = ContentStore::new(&dir).unwrap();
+        let bad = "../../../etc/passwd";
+        assert!(store.get(bad).is_none());
+        assert!(!store.has(bad));
+        assert!(store.file_size(bad).is_none());
+        assert!(store.serve_chunk(bad, 0).is_none());
+        assert!(store.begin_fetch(bad, 100, 100).is_err());
+        assert!(store.load_meta(bad).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 }
