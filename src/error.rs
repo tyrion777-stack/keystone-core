@@ -22,4 +22,7 @@ pub enum KeystoneError {
 
     #[error("Invalid content hash: {0}")]
     InvalidHash(String),
+
+    #[error("Invalid chunk parameter: {0}")]
+    InvalidChunk(String),
 }

@@ -9,6 +9,11 @@ use crate::error::KeystoneError;
 
 const KB: u64 = 1024;
 const MB: u64 = 1024 * KB;
+const GB: u64 = 1024 * MB;
+
+pub const MAX_CHUNK_SIZE: u64 = 4 * MB;
+pub const MAX_TOTAL_SIZE: u64 = 8 * GB;
+pub const MAX_CHUNKS: usize = 65_536;
 
 /// Chunk size is decided once from the file size and stored in the ContentRecord.
 /// Larger files get larger chunks to keep the request count manageable.
@@ -127,12 +132,28 @@ impl ContentStore {
     /// Resumes an existing in-progress fetch if a .meta sidecar already exists.
     pub fn begin_fetch(&self, hash: &str, total_size: u64, chunk_size: u64) -> Result<ContentRecord, KeystoneError> {
         validate_hash(hash)?;
+        if chunk_size == 0 || chunk_size > MAX_CHUNK_SIZE {
+            return Err(KeystoneError::InvalidChunk(format!(
+                "chunk_size {chunk_size} must be 1..={MAX_CHUNK_SIZE}"
+            )));
+        }
+        if total_size > MAX_TOTAL_SIZE {
+            return Err(KeystoneError::InvalidChunk(format!(
+                "total_size {total_size} exceeds limit {MAX_TOTAL_SIZE}"
+            )));
+        }
+        let num_chunks = (total_size + chunk_size - 1) / chunk_size;
+        if num_chunks > MAX_CHUNKS as u64 {
+            return Err(KeystoneError::InvalidChunk(format!(
+                "num_chunks {num_chunks} exceeds limit {MAX_CHUNKS}"
+            )));
+        }
+
         // Resume if we have an existing partial fetch
         if let Some(record) = self.load_meta(hash) {
             return Ok(record);
         }
 
-        let num_chunks = (total_size + chunk_size - 1) / chunk_size;
         let record = ContentRecord {
             hash: hash.to_string(),
             size: total_size,
@@ -152,7 +173,30 @@ impl ContentStore {
 
     /// Write one chunk at its correct offset and mark it Complete in the record.
     pub fn write_chunk(&self, record: &mut ContentRecord, chunk_index: u64, data: &[u8]) -> Result<(), KeystoneError> {
-        let offset = chunk_index * record.chunk_size;
+        let idx = usize::try_from(chunk_index)
+            .ok()
+            .filter(|&i| i < record.chunks.len())
+            .ok_or_else(|| KeystoneError::InvalidChunk(format!(
+                "chunk_index {chunk_index} out of bounds (len={})", record.chunks.len()
+            )))?;
+
+        if data.len() > record.chunk_size as usize {
+            return Err(KeystoneError::InvalidChunk(format!(
+                "data len {} exceeds chunk_size {}", data.len(), record.chunk_size
+            )));
+        }
+        // Every chunk except the last must be exactly chunk_size bytes.
+        let is_last = idx == record.chunks.len() - 1;
+        if !is_last && data.len() != record.chunk_size as usize {
+            return Err(KeystoneError::InvalidChunk(format!(
+                "non-final chunk {chunk_index} has len {} but chunk_size is {}",
+                data.len(), record.chunk_size
+            )));
+        }
+
+        let offset = chunk_index.checked_mul(record.chunk_size)
+            .ok_or_else(|| KeystoneError::InvalidChunk("chunk offset overflow".to_string()))?;
+
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .open(self.dir.join(&record.hash))
@@ -163,7 +207,7 @@ impl ContentStore {
         file.write_all(data)
             .map_err(|e| KeystoneError::KeyStorage(e.to_string()))?;
 
-        record.chunks[chunk_index as usize] = ChunkState::Complete;
+        record.chunks[idx] = ChunkState::Complete;
         self.save_meta(record)?;
         Ok(())
     }
@@ -351,6 +395,97 @@ mod tests {
         assert!(store.serve_chunk(bad, 0).is_none());
         assert!(store.begin_fetch(bad, 100, 100).is_err());
         assert!(store.load_meta(bad).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Chunk bounds and parameter validation ---
+
+    fn valid_hash() -> String {
+        hex::encode(blake3::hash(b"chunk_validation_tests").as_bytes())
+    }
+
+    #[test]
+    fn begin_fetch_rejects_zero_chunk_size() {
+        let dir = tmp("ks_cb1");
+        let store = ContentStore::new(&dir).unwrap();
+        assert!(store.begin_fetch(&valid_hash(), 1024, 0).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn begin_fetch_rejects_chunk_size_over_cap() {
+        let dir = tmp("ks_cb2");
+        let store = ContentStore::new(&dir).unwrap();
+        assert!(store.begin_fetch(&valid_hash(), 1024, MAX_CHUNK_SIZE + 1).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn begin_fetch_rejects_total_size_over_cap() {
+        let dir = tmp("ks_cb3");
+        let store = ContentStore::new(&dir).unwrap();
+        assert!(store.begin_fetch(&valid_hash(), MAX_TOTAL_SIZE + 1, 512 * KB).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn begin_fetch_rejects_num_chunks_over_cap() {
+        let dir = tmp("ks_cb4");
+        let store = ContentStore::new(&dir).unwrap();
+        // chunk_size=1 (valid), total_size=MAX_CHUNKS+1 → num_chunks = MAX_CHUNKS+1
+        assert!(store.begin_fetch(&valid_hash(), MAX_CHUNKS as u64 + 1, 1).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_chunk_rejects_out_of_bounds_index() {
+        let dir = tmp("ks_cb5");
+        let store = ContentStore::new(&dir).unwrap();
+        let hash = valid_hash();
+        let mut record = store.begin_fetch(&hash, 512, 512 * KB).unwrap();
+        // record has 1 chunk; index 1 is out of bounds
+        assert!(store.write_chunk(&mut record, 1, &[0u8; 512]).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_chunk_rejects_oversized_data() {
+        let dir = tmp("ks_cb6");
+        let store = ContentStore::new(&dir).unwrap();
+        let hash = valid_hash();
+        let chunk_sz = 512 * KB;
+        let mut record = store.begin_fetch(&hash, chunk_sz, chunk_sz).unwrap();
+        let oversized = vec![0u8; chunk_sz as usize + 1];
+        assert!(store.write_chunk(&mut record, 0, &oversized).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_chunk_rejects_undersized_non_final_chunk() {
+        let dir = tmp("ks_cb7");
+        let store = ContentStore::new(&dir).unwrap();
+        let hash = valid_hash();
+        let chunk_sz = 512 * KB;
+        // Two-chunk file: chunk 0 is non-final and must be exactly chunk_sz bytes.
+        let mut record = store.begin_fetch(&hash, 2 * chunk_sz, chunk_sz).unwrap();
+        assert!(store.write_chunk(&mut record, 0, &[0u8; 1]).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_chunk_rejects_offset_overflow() {
+        let dir = tmp("ks_cb8");
+        let store = ContentStore::new(&dir).unwrap();
+        // Construct a record directly, bypassing begin_fetch, to force a huge chunk_size
+        // that would overflow u64 when multiplied by chunk_index 2.
+        let mut record = ContentRecord {
+            hash: valid_hash(),
+            size: 100,
+            chunk_size: u64::MAX / 2 + 1,
+            chunks: vec![ChunkState::Pending; 3],
+        };
+        // offset = 2 * (u64::MAX/2 + 1) wraps past u64::MAX
+        assert!(store.write_chunk(&mut record, 2, &[]).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 }
